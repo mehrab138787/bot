@@ -3,9 +3,9 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║         🤖  ربات مدیریت حرفه‌ای گروه‌های تلگرام  🤖           ║
 ║                    Group Manager Bot                         ║
-║              Telethon + PostgreSQL + asyncio                 ║
+║         Telethon + PostgreSQL + Flask + asyncio              ║
 ║      ✨ ایموجی پرمیوم + پروکسی + گزارش کلیک‌پذیر ✨         ║
-║              🚀 آماده استقرار روی Render                     ║
+║           🚀 آماده استقرار روی Render (Web Service)          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -13,6 +13,7 @@ import os
 import re
 import asyncio
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 
@@ -20,6 +21,7 @@ import socks
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
+from flask import Flask
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.channels import EditBannedRequest, GetParticipantRequest
 from telethon.tl.types import (
@@ -50,14 +52,14 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 _log_channel = os.getenv("LOG_CHANNEL_ID", "").strip()
 LOG_CHANNEL_ID = int(_log_channel) if _log_channel.lstrip("-").isdigit() else None
 
-# تنظیمات پروکسی (اختیاری - برای Render نیازی نیست)
+# تنظیمات پروکسی (اختیاری - برای Render خالی بگذارید)
 PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
 PROXY_PORT = int(os.getenv("PROXY_PORT", "0") or 0)
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 MAX_MUTE_SECONDS = 366 * 86400
 
-# لیست همه ادمین‌های ارشد (که لاگ می‌گیرند و به پنل دسترسی دارند)
+# لیست همه ادمین‌های ارشد
 SUPER_ADMINS = [uid for uid in (OWNER_ID, SECOND_ADMIN_ID) if uid]
 
 
@@ -71,6 +73,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("GroupManagerBot")
 logging.getLogger("telethon").setLevel(logging.WARNING)
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
 # ═════════════════════════════════════════════
@@ -446,7 +449,6 @@ def build_message_link(chat_id, message_id):
 
 def format_report(action_title, action_emoji_key, target, admin_user, chat, reason, link):
     """ساخت متن زیبای گزارش عملیات با ایموجی پرمیوم و لینک‌های کلیک‌پذیر"""
-    # اطلاعات کاربر هدف
     target_name = user_display(target)
     target_username = getattr(target, "username", None)
     target_id_link = f'<a href="tg://user?id={target.id}">{target.id}</a>'
@@ -455,7 +457,6 @@ def format_report(action_title, action_emoji_key, target, admin_user, chat, reas
         if target_username else "—"
     )
 
-    # اطلاعات ادمین
     admin_name = user_display(admin_user)
     admin_username = getattr(admin_user, "username", None)
     admin_id_link = f'<a href="tg://user?id={admin_user.id}">{admin_user.id}</a>'
@@ -464,7 +465,6 @@ def format_report(action_title, action_emoji_key, target, admin_user, chat, reas
         if admin_username else "—"
     )
 
-    # اطلاعات گروه
     chat_title = getattr(chat, "title", "—") or "—"
     chat_username = getattr(chat, "username", None)
     chat_title_txt = (
@@ -1179,7 +1179,30 @@ async def cmd_stats(event):
 
 
 # ═════════════════════════════════════════════
-# ۱۴) راه‌اندازی ربات
+# ۱۴) وب‌سرور کوچک Flask برای Render (Web Service رایگان)
+# ═════════════════════════════════════════════
+web_app = Flask(__name__)
+
+
+@web_app.route("/")
+def index():
+    return "🤖 Group Manager Bot is running", 200
+
+
+@web_app.route("/health")
+def health():
+    return "OK", 200
+
+
+def run_web_server():
+    """اجرای وب‌سرور روی پورت Render (پیش‌فرض: 10000)"""
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"🌐 وب‌سرور Flask روی پورت {port} اجرا شد")
+    web_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
+
+# ═════════════════════════════════════════════
+# ۱۵) راه‌اندازی ربات
 # ═════════════════════════════════════════════
 async def _periodic_cleanup():
     while True:
@@ -1229,8 +1252,16 @@ async def main():
     await client.run_until_disconnected()
 
 
+# ═════════════════════════════════════════════
+# ۱۶) نقطه ورود برنامه (اجرای همزمان وب‌سرور + ربات)
+# ═════════════════════════════════════════════
 if __name__ == "__main__":
     try:
+        # وب‌سرور Flask را در یک thread جداگانه اجرا کن
+        web_thread = threading.Thread(target=run_web_server, daemon=True)
+        web_thread.start()
+
+        # ربات تلگرام را در thread اصلی اجرا کن
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("⛔ ربات توسط کاربر متوقف شد.")
