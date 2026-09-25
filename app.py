@@ -4,7 +4,7 @@
 ║         🤖  ربات مدیریت حرفه‌ای گروه‌های تلگرام  🤖           ║
 ║                    Group Manager Bot                         ║
 ║         Telethon + PostgreSQL + Flask + asyncio              ║
-║   ✨ ایموجی پرمیوم + اخطار + واسطه خودکار + گزارش کلیک‌پذیر ✨ ║
+║   ✨ ایموجی پرمیوم + اخطار + واسطه + تایید/رد + محتوای پیام ✨║
 ║           🚀 آماده استقرار روی Render (Web Service)          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -60,7 +60,6 @@ IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 MAX_MUTE_SECONDS = 366 * 86400
 DEFAULT_MAX_WARNINGS = 3
 
-# لیست همه ادمین‌های ارشد (مالک + ادمین‌های لاگ‌گیرنده)
 SUPER_ADMINS = [uid for uid in (OWNER_ID, SECOND_ADMIN_ID, THIRD_ADMIN_ID) if uid]
 
 # ═════════════════════════════════════════════
@@ -375,6 +374,7 @@ PREMIUM_EMOJI = {
     "shield": "5397782960512444700",
     "clock": "5458603043203327669",
     "handshake": "5447410659077661506",
+    "message": "5443038326535759644",
 }
 
 
@@ -394,7 +394,7 @@ COMMAND_KEYWORDS = {
     "unban": ["unban", "آنبن", "آن بن", "انبن", "ان بن"],
     "warn": ["warn", "اخطار", "هشدار"],
     "mute": ["mute", "silence", "سکوت", "میوت"],
-    "ban": ["ban", "مسدود", "بن"],
+    "ban": ["ban", "مسدود", "بن", "سیک", "صیک", "سیکش", "صیکش"],
 }
 
 
@@ -414,10 +414,6 @@ def parse_command(text):
 
 
 def parse_duration(text):
-    """
-    تشخیص مدت زمان و دلیل.
-    خروجی: (seconds, reason)
-    """
     text = (text or "").strip()
     if not text:
         return 3600, ""
@@ -429,7 +425,7 @@ def parse_duration(text):
     m = re.match(r"^(\d+)([smhdSMHD])?$", first)
     if m:
         num = int(m.group(1))
-        unit = (m.group(2) or "m").lower()  # پیش‌فرض: دقیقه
+        unit = (m.group(2) or "m").lower()
         mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
         seconds = num * mult
         if seconds > MAX_MUTE_SECONDS:
@@ -483,8 +479,9 @@ def build_message_link(chat_id, message_id):
     return None
 
 
-def format_report(action_title, action_emoji_key, target, admin_user, chat, reason, link):
-    """گزارش زیبا با لینک‌های کلیک‌پذیر"""
+def format_report(action_title, action_emoji_key, target, admin_user, chat,
+                  reason, link, target_message=None):
+    """گزارش زیبا با لینک‌های کلیک‌پذیر + محتوای پیام کاربر (اختیاری)"""
     target_name = user_display(target)
     target_username = getattr(target, "username", None)
     target_id_link = f'<a href="tg://user?id={target.id}">{target.id}</a>'
@@ -511,6 +508,18 @@ def format_report(action_title, action_emoji_key, target, admin_user, chat, reas
     reason_txt = h(reason) if reason else "—"
     link_txt = f'<a href="{link}">اینجا کلیک کنید</a>' if link else "—"
 
+    # بخش پیام کاربر (در صورت وجود)
+    msg_section = ""
+    if target_message:
+        preview = target_message.strip()
+        if len(preview) > 400:
+            preview = preview[:400] + "..."
+        msg_section = (
+            "\n┏━━━ " + prem('message', '📝') + " <b>پیام کاربر هدف</b> ━━━┓\n"
+            f"┃ <blockquote>{h(preview)}</blockquote>\n"
+            "┗━━━━━━━━━━━━━━━━━━━━┛\n"
+        )
+
     return (
         "╔══════════════════════════════════╗\n"
         f"   {prem(action_emoji_key, '📢')} <b>گزارش عملیات جدید</b> {prem(action_emoji_key, '📢')}\n"
@@ -532,8 +541,9 @@ def format_report(action_title, action_emoji_key, target, admin_user, chat, reas
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{chat.id}</code>\n"
         f"┃ {prem('reason', '💬')} <b>دلیل:</b> {reason_txt}\n"
         f"┃ {prem('link', '🔗')} <b>پیام:</b> {link_txt}\n"
-        "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "┗━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"{msg_section}"
+        "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "🤖 <i>Group Manager Bot</i>"
     )
 
@@ -569,20 +579,33 @@ async def get_reply_target(event):
         return None
 
 
+async def get_replied_message_text(event):
+    """گرفتن متن پیام ریپلای‌شده (اگه وجود داشته باشه)"""
+    if not event.is_reply:
+        return None
+    try:
+        reply = await event.get_reply_message()
+        if not reply:
+            return None
+        txt = reply.text or reply.message or ""
+        if not txt and reply.media:
+            return "📎 [محتوای مدیا]"
+        return txt.strip() or None
+    except Exception:
+        return None
+
+
 def is_mediator_group(chat_id, raw_chat_id=None):
-    """
-    تشخیص چت واسطه - هم با فرمت -100... هم با فرمت بدون 100 کار می‌کنه.
-    """
     candidates = set()
 
     def add_candidates(val):
         try:
             s = str(abs(int(val)))
-            candidates.add(int(s))  # مثلاً 4337969779 یا 1004337969779
+            candidates.add(int(s))
             if s.startswith("100") and len(s) > 10:
-                candidates.add(int(s[3:]))       # 4337969779
+                candidates.add(int(s[3:]))
             else:
-                candidates.add(int("100" + s))   # 1004337969779
+                candidates.add(int("100" + s))
         except Exception:
             pass
 
@@ -593,20 +616,30 @@ def is_mediator_group(chat_id, raw_chat_id=None):
     return MEDIATOR_CHAT_ID in candidates
 
 
+def is_mediator_request(raw_text):
+    """فقط اگه متن دقیقاً 'واسطه' بود (تک کلمه)"""
+    return (raw_text or "").strip() == MEDIATOR_KEYWORD
+
+
 # ═════════════════════════════════════════════
 # ۷) ارسال گزارش
 # ═════════════════════════════════════════════
-async def send_report(text):
+async def send_report(text, buttons=None):
     """ارسال گزارش به همه ادمین‌های ارشد + کانال لاگ"""
     for admin_id in SUPER_ADMINS:
         try:
-            await client.send_message(admin_id, text, parse_mode="html", link_preview=False)
+            await client.send_message(
+                admin_id, text, parse_mode="html",
+                link_preview=False, buttons=buttons,
+            )
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش به {admin_id}: {ex}")
 
     if LOG_CHANNEL_ID:
         try:
-            await client.send_message(LOG_CHANNEL_ID, text, parse_mode="html", link_preview=False)
+            await client.send_message(
+                LOG_CHANNEL_ID, text, parse_mode="html", link_preview=False
+            )
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش به کانال: {ex}")
 
@@ -614,7 +647,13 @@ async def send_report(text):
 # ═════════════════════════════════════════════
 # ۸) سیستم واسطه خودکار
 # ═════════════════════════════════════════════
-async def handle_mediator_request(event, chat, sender):
+async def handle_mediator_request(event, chat, sender, replied_target=None):
+    """
+    اگه replied_target داده شده:
+        → آیدی فرستنده + آیدی طرف مقابل
+    وگرنه:
+        → فقط آیدی فرستنده
+    """
     now_ts = datetime.now(timezone.utc).timestamp()
     uid = sender.id if sender else event.sender_id
 
@@ -631,6 +670,7 @@ async def handle_mediator_request(event, chat, sender):
         return
     _MEDIATOR_COOLDOWN[uid] = now_ts
 
+    # ── اطلاعات درخواست‌دهنده ──
     sender_name = user_display(sender) if sender else "ناشناس"
     sender_username = getattr(sender, "username", None) if sender else None
     sender_id_link = f'<a href="tg://user?id={uid}">{uid}</a>'
@@ -639,6 +679,27 @@ async def handle_mediator_request(event, chat, sender):
         if sender_username else "—"
     )
 
+    # ── اطلاعات طرف مقابل (اگه ریپلای شده) ──
+    target_section_group = ""
+    target_section_admin = ""
+    if replied_target is not None:
+        tgt_name = user_display(replied_target)
+        tgt_username = getattr(replied_target, "username", None)
+        tgt_id_link = f'<a href="tg://user?id={replied_target.id}">{replied_target.id}</a>'
+        tgt_username_link = (
+            f'<a href="https://t.me/{tgt_username}">@{tgt_username}</a>'
+            if tgt_username else "—"
+        )
+        target_section_group = (
+            "\n┏━━━ 🎯 <b>طرف مقابل</b> ━━━┓\n"
+            f"┃ 🏷️ <b>نام:</b> {h(tgt_name)}\n"
+            f"┃ {prem('id', '🆔')} <b>آیدی:</b> {tgt_id_link}\n"
+            f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {tgt_username_link}\n"
+            "┗━━━━━━━━━━━━━━━━━━━━┛\n"
+        )
+        target_section_admin = target_section_group
+
+    # ── پیام گروه ──
     group_reply = (
         "╔══════════════════════════════════╗\n"
         f"   {prem('handshake', '🤝')} <b>درخواست واسطه ثبت شد</b> {prem('handshake', '🤝')}\n"
@@ -647,7 +708,9 @@ async def handle_mediator_request(event, chat, sender):
         f"┃ 🏷️ <b>نام:</b> {h(sender_name)}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> {sender_id_link}\n"
         f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {sender_username_link}\n"
-        "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        "┗━━━━━━━━━━━━━━━━━━━━┛"
+        f"{target_section_group}"
+        "\n"
         f"{prem('star', '⭐')} <b>واسطه‌های رسمی:</b>\n"
         f"┃ 👤 {MEDIATOR_USERNAMES[0]}\n"
         f"┃ 👤 {MEDIATOR_USERNAMES[1]}\n\n"
@@ -659,6 +722,7 @@ async def handle_mediator_request(event, chat, sender):
     except Exception as ex:
         logger.error(f"خطا در ارسال پیام واسطه در گروه: {ex}")
 
+    # ── گزارش به ادمین‌ها با دکمه ──
     chat_title = getattr(chat, "title", "—") or "—"
     chat_username = getattr(chat, "username", None)
     chat_title_txt = (
@@ -677,26 +741,38 @@ async def handle_mediator_request(event, chat, sender):
         f"┃ 🏷️ <b>نام:</b> {h(sender_name)}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> {sender_id_link}\n"
         f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {sender_username_link}\n"
-        "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
-        "┏━━━ 📌 <b>گروه</b> ━━━┓\n"
+        "┗━━━━━━━━━━━━━━━━━━━━┛"
+        f"{target_section_admin}"
+        "\n┏━━━ 📌 <b>گروه</b> ━━━┓\n"
         f"┃ 🏷️ <b>نام:</b> {chat_title_txt}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{chat.id}</code>\n"
         f"┃ {prem('link', '🔗')} <b>لینک پیام:</b> "
         f"{f'<a href=\"{link}\">اینجا کلیک کنید</a>' if link else '—'}\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
-        f"{prem('warning', '⚠️')} <b>لطفاً در اسرع وقت بررسی کنید.</b>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🤖 <i>Group Manager Bot</i>"
+        f"{prem('warning', '⚠️')} <b>از دکمه‌های زیر برای تایید یا رد استفاده کنید:</b>"
     )
+
+    target_uid = replied_target.id if replied_target else 0
+    buttons = [[
+        Button.inline("✅ تایید", data=f"med_a:{uid}:{target_uid}".encode()),
+        Button.inline("❌ رد", data=f"med_r:{uid}:{target_uid}".encode()),
+    ]]
+
     for admin_id in SUPER_ADMINS:
         try:
-            await client.send_message(admin_id, admin_msg, parse_mode="html", link_preview=False)
+            await client.send_message(
+                admin_id, admin_msg, parse_mode="html",
+                link_preview=False, buttons=buttons,
+            )
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش واسطه به {admin_id}: {ex}")
 
     if LOG_CHANNEL_ID:
         try:
-            await client.send_message(LOG_CHANNEL_ID, admin_msg, parse_mode="html", link_preview=False)
+            await client.send_message(
+                LOG_CHANNEL_ID, admin_msg, parse_mode="html",
+                link_preview=False, buttons=buttons,
+            )
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش واسطه به کانال: {ex}")
 
@@ -789,7 +865,7 @@ def _free_rights():
     return ChatBannedRights(until_date=None)
 
 
-async def do_ban(event, chat, target, reason, admin_user):
+async def do_ban(event, chat, target, reason, admin_user, target_msg=None):
     try:
         await client(EditBannedRequest(chat.id, target.id, _full_ban_rights()))
     except (ChatAdminRequiredError, UserAdminInvalidError):
@@ -816,7 +892,8 @@ async def do_ban(event, chat, target, reason, admin_user):
     )
 
     link = build_message_link(chat.id, event.reply_to_msg_id or event.id)
-    report = format_report("بن کردن کاربر", "ban", target, admin_user, chat, reason, link)
+    report = format_report("بن کردن کاربر", "ban", target, admin_user, chat,
+                           reason, link, target_message=target_msg)
     await send_report(report)
 
 
@@ -853,7 +930,7 @@ async def do_unban(event, chat, target, reason, admin_user):
     await send_report(report)
 
 
-async def do_mute(event, chat, target, reason, admin_user, seconds):
+async def do_mute(event, chat, target, reason, admin_user, seconds, target_msg=None):
     if seconds > MAX_MUTE_SECONDS:
         seconds = MAX_MUTE_SECONDS
     until_dt = datetime.now(timezone.utc) + timedelta(seconds=seconds)
@@ -889,7 +966,7 @@ async def do_mute(event, chat, target, reason, admin_user, seconds):
     full_reason = f"{duration_txt}" + (f" - {reason}" if reason else "")
     report = format_report(
         f"میوت کردن کاربر ({duration_txt})", "mute", target, admin_user,
-        chat, full_reason, link,
+        chat, full_reason, link, target_message=target_msg,
     )
     await send_report(report)
 
@@ -925,7 +1002,7 @@ async def do_unmute(event, chat, target, reason, admin_user):
     await send_report(report)
 
 
-async def do_warn(event, chat, target, reason, admin_user):
+async def do_warn(event, chat, target, reason, admin_user, target_msg=None):
     try:
         max_warns = int(db.get_setting("max_warnings", str(DEFAULT_MAX_WARNINGS)) or DEFAULT_MAX_WARNINGS)
     except Exception:
@@ -959,7 +1036,8 @@ async def do_warn(event, chat, target, reason, admin_user):
             link = build_message_link(chat.id, event.reply_to_msg_id or event.id)
             full_reason = f"بن خودکار پس از {max_warns} اخطار" + (f" - {reason}" if reason else "")
             report = format_report(
-                f"اخطار {max_warns}ام و بن خودکار", "ban", target, admin_user, chat, full_reason, link,
+                f"اخطار {max_warns}ام و بن خودکار", "ban", target, admin_user,
+                chat, full_reason, link, target_message=target_msg,
             )
             await send_report(report)
         else:
@@ -986,6 +1064,7 @@ async def do_warn(event, chat, target, reason, admin_user):
         report = format_report(
             f"اخطار دادن به کاربر ({new_count}/{max_warns})",
             "warning", target, admin_user, chat, full_reason, link,
+            target_message=target_msg,
         )
         await send_report(report)
 
@@ -1027,13 +1106,15 @@ async def group_handler(event):
 
         raw_text = (event.raw_text or "").strip()
 
-        # ═══ اول: بررسی درخواست واسطه ═══
-        if is_mediator_group(event.chat_id, chat.id) and MEDIATOR_KEYWORD in raw_text:
+        # ═══ اول: بررسی درخواست واسطه (فقط تک کلمه «واسطه») ═══
+        if is_mediator_group(event.chat_id, chat.id) and is_mediator_request(raw_text):
             try:
                 sender = await event.get_sender()
             except Exception:
                 sender = None
-            await handle_mediator_request(event, chat, sender)
+            # اگه روی کسی ریپلای زده باشه، طرف مقابل رو هم بگیر
+            replied_target = await get_reply_target(event)
+            await handle_mediator_request(event, chat, sender, replied_target=replied_target)
             return
 
         # ═══ دوم: بررسی ادمین بودن ═══
@@ -1083,24 +1164,27 @@ async def group_handler(event):
 
         admin_user = sender if sender is not None else await event.get_sender()
 
-        # ─── بن: دلیل اجباری ───
+        # محتوای پیام کاربر هدف (برای گزارش)
+        target_msg = await get_replied_message_text(event)
+
+        # ─── بن ───
         if cmd == "ban":
             if not rest:
                 await event.reply(
                     f"{prem('warning', '⚠️')} <b>برای بن کردن کاربر، حتماً باید دلیل بنویسید.</b>\n\n"
                     f"📌 <b>مثال:</b>\n"
                     f"┃ <code>بن تبلیغات</code>\n"
-                    f"┃ <code>بن ارسال لینک</code>\n"
-                    f"┃ <code>بن اسپم</code>",
+                    f"┃ <code>سیک اسپم</code>\n"
+                    f"┃ <code>صیک ارسال لینک</code>",
                     parse_mode="html",
                 )
                 return
-            await do_ban(event, chat, target, rest, admin_user)
+            await do_ban(event, chat, target, rest, admin_user, target_msg=target_msg)
 
         elif cmd == "unban":
             await do_unban(event, chat, target, rest, admin_user)
 
-        # ─── سکوت: دلیل اجباری ───
+        # ─── سکوت ───
         elif cmd == "mute":
             seconds, reason = parse_duration(rest)
             if not reason:
@@ -1115,12 +1199,12 @@ async def group_handler(event):
                     parse_mode="html",
                 )
                 return
-            await do_mute(event, chat, target, reason, admin_user, seconds)
+            await do_mute(event, chat, target, reason, admin_user, seconds, target_msg=target_msg)
 
         elif cmd == "unmute":
             await do_unmute(event, chat, target, rest, admin_user)
 
-        # ─── اخطار: دلیل اجباری ───
+        # ─── اخطار ───
         elif cmd == "warn":
             if not rest:
                 await event.reply(
@@ -1132,7 +1216,7 @@ async def group_handler(event):
                     parse_mode="html",
                 )
                 return
-            await do_warn(event, chat, target, rest, admin_user)
+            await do_warn(event, chat, target, rest, admin_user, target_msg=target_msg)
 
         elif cmd == "unwarn":
             await do_unwarn(event, chat, target, rest, admin_user)
@@ -1155,13 +1239,13 @@ MAIN_MENU_TEXT = (
     "سلام مالک عزیز 👋\n"
     "به پنل مدیریت <b>گروه‌بان</b> خوش آمدید.\n\n"
     f"{prem('star', '⭐')} <b>قابلیت‌ها:</b>\n"
-    f"┃ {prem('ban', '🚫')} بن کردن کاربر\n"
+    f"┃ {prem('ban', '🚫')} بن کردن کاربر (بن / سیک / صیک)\n"
     f"┃ {prem('unban', '✅')} آنبن کردن کاربر\n"
     f"┃ {prem('mute', '🔇')} میوت کردن کاربر\n"
     f"┃ {prem('unmute', '🔊')} آن‌میوت کردن کاربر\n"
     f"┃ {prem('warning', '⚠️')} اخطار و بن خودکار\n"
     f"┃ {prem('shield', '🛡')} مدیریت ادمین‌ها\n"
-    f"┃ 🤝 درخواست واسطه خودکار\n"
+    f"┃ 🤝 درخواست واسطه با تایید/رد\n"
     f"┃ 🚨 ضد اسپم و ضد لینک\n\n"
     "از دکمه‌های زیر استفاده کنید:"
 )
@@ -1211,6 +1295,11 @@ async def on_callback(event):
 
         data = event.data.decode("utf-8", "ignore")
 
+        # ─── بررسی دکمه‌های واسطه (تایید/رد) ───
+        if data.startswith("med_a:") or data.startswith("med_r:"):
+            await handle_mediator_callback(event, data)
+            return
+
         if data == "back":
             await event.edit(MAIN_MENU_TEXT, buttons=MAIN_MENU_BUTTONS, parse_mode="html")
             await event.answer()
@@ -1254,6 +1343,99 @@ async def on_callback(event):
         logger.exception(f"خطا در callback: {ex}")
         try:
             await event.answer("خطایی رخ داد!", alert=True)
+        except Exception:
+            pass
+
+
+async def handle_mediator_callback(event, data):
+    """پردازش دکمه‌های تایید/رد واسطه"""
+    try:
+        # data شبیه: med_a:123:456 یا med_r:123:0
+        parts = data.split(":")
+        action = parts[0]  # med_a یا med_r
+        requester_id = int(parts[1])
+        target_id = int(parts[2]) if len(parts) > 2 else 0
+
+        admin_user = await event.get_sender()
+        admin_name = user_display(admin_user)
+
+        is_approve = action == "med_a"
+
+        if is_approve:
+            status_emoji = "✅"
+            status_text = "تایید شد"
+            status_color = "🟢"
+        else:
+            status_emoji = "❌"
+            status_text = "رد شد"
+            status_color = "🔴"
+
+        # متن پیام‌های اطلاع‌رسانی
+        requester_link = f'<a href="tg://user?id={requester_id}">{requester_id}</a>'
+        target_line = ""
+        if target_id:
+            target_link = f'<a href="tg://user?id={target_id}">{target_id}</a>'
+            target_line = f"\n┃ 🎯 <b>طرف مقابل:</b> {target_link}"
+
+        # به درخواست‌دهنده پیام بده
+        try:
+            await client.send_message(
+                requester_id,
+                f"{status_color} <b>درخواست واسطه شما {status_text}</b>\n\n"
+                f"👤 <b>توسط ادمین:</b> {h(admin_name)}\n"
+                f"⏱ <b>زمان:</b> {now_iran_str()}",
+                parse_mode="html",
+            )
+        except Exception as ex:
+            logger.debug(f"ارسال به درخواست‌دهنده ناموفق: {ex}")
+
+        # به طرف مقابل هم پیام بده (اگه وجود داره)
+        if target_id:
+            try:
+                await client.send_message(
+                    target_id,
+                    f"{status_color} <b>وضعیت درخواست واسطه</b>\n\n"
+                    f"✅ <b>وضعیت:</b> {status_text}\n"
+                    f"👤 <b>توسط ادمین:</b> {h(admin_name)}\n"
+                    f"⏱ <b>زمان:</b> {now_iran_str()}",
+                    parse_mode="html",
+                )
+            except Exception as ex:
+                logger.debug(f"ارسال به طرف مقابل ناموفق: {ex}")
+
+        # به همه ادمین‌ها اطلاع بده (روی همون پیام ویرایش کن یا پیام جدید)
+        result_msg = (
+            "╔══════════════════════════════════╗\n"
+            f"   {status_emoji} <b>واسطه {status_text}</b> {status_emoji}\n"
+            "╚══════════════════════════════════╝\n\n"
+            f"👤 <b>توسط ادمین:</b> {h(admin_name)}\n"
+            f"🆔 <b>آیدی ادمین:</b> <code>{admin_user.id}</code>\n\n"
+            f"┏━━━ 🎯 <b>درخواست‌دهنده</b> ━━━┓\n"
+            f"┃ {prem('id', '🆔')} <b>آیدی:</b> {requester_link}"
+            f"{target_line}\n"
+            "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+            f"⏱ <b>زمان:</b> {now_iran_str()}"
+        )
+
+        try:
+            await event.edit(result_msg, parse_mode="html", buttons=None)
+        except MessageNotModifiedError:
+            pass
+        except Exception as ex:
+            logger.warning(f"ویرایش پیام واسطه ناموفق: {ex}")
+
+        db.add_log(
+            "mediator-approve" if is_approve else "mediator-reject",
+            requester_id, admin_user.id, 0,
+            f"target={target_id}",
+        )
+
+        await event.answer(f"{status_emoji} درخواست واسطه {status_text}")
+
+    except Exception as ex:
+        logger.exception(f"خطا در handle_mediator_callback: {ex}")
+        try:
+            await event.answer("خطا در پردازش!", alert=True)
         except Exception:
             pass
 
@@ -1405,6 +1587,8 @@ async def cb_help(event):
         "برای اجرای دستور، روی پیام کاربر هدف <b>ریپلای</b> بزنید:\n\n"
         f"┏━━━ {prem('ban', '🚫')} <b>بن کردن</b> ━━━┓\n"
         "┃ <code>بن [دلیل]</code>\n"
+        "┃ <code>سیک [دلیل]</code>\n"
+        "┃ <code>صیک [دلیل]</code>\n"
         "┃ 🔹 مثال: <code>بن تبلیغات</code>\n"
         "┃ ⚠️ بدون دلیل اجرا نمی‌شود\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
@@ -1434,7 +1618,8 @@ async def cb_help(event):
         "┗━━━━━━━━━━━━━━━┛\n\n"
         f"┏━━━ {prem('handshake', '🤝')} <b>واسطه</b> ━━━┓\n"
         f"┃ در گپ <code>{MEDIATOR_CHAT_ID}</code> بنویسید:\n"
-        "┃ <code>واسطه</code>\n"
+        "┃ <code>واسطه</code> (دقیقاً فقط همین کلمه)\n"
+        "┃ 🔹 اگه روی پیام کسی ریپلای بزنید، آیدی هر دو ثبت می‌شه\n"
         "┗━━━━━━━━━━━━━━━┛"
     )
     await event.edit(text, buttons=[[Button.inline("🔙 بازگشت", data=b"back")]], parse_mode="html")
@@ -1510,7 +1695,7 @@ async def cmd_help(event):
         f"{prem('info', '📖')} <b>راهنمای ربات گروه‌بان</b>\n\n"
         "🔹 ربات را به گروه اضافه کنید و ادمین کنید.\n"
         "🔹 سپس روی پیام کاربر ریپلای بزنید و ارسال کنید:\n\n"
-        f"{prem('ban', '🚫')} <code>بن [دلیل]</code> - بن (دلیل اجباری)\n"
+        f"{prem('ban', '🚫')} <code>بن/سیک/صیک [دلیل]</code> - بن (دلیل اجباری)\n"
         f"{prem('unban', '✅')} <code>آنبن</code> - آنبن\n"
         f"{prem('mute', '🔇')} <code>سکوت [زمان] [دلیل]</code> - میوت (دلیل اجباری)\n"
         f"{prem('unmute', '🔊')} <code>آن‌میوت</code> - رفع میوت\n"
