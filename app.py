@@ -4,7 +4,7 @@
 ║         🤖  ربات مدیریت حرفه‌ای گروه‌های تلگرام  🤖           ║
 ║                    Group Manager Bot                         ║
 ║         Telethon + PostgreSQL + Flask + asyncio              ║
-║      ✨ ایموجی پرمیوم + پروکسی + گزارش کلیک‌پذیر ✨         ║
+║   ✨ ایموجی پرمیوم + اخطار + واسطه خودکار + گزارش کلیک‌پذیر ✨ ║
 ║           🚀 آماده استقرار روی Render (Web Service)          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -52,15 +52,24 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 _log_channel = os.getenv("LOG_CHANNEL_ID", "").strip()
 LOG_CHANNEL_ID = int(_log_channel) if _log_channel.lstrip("-").isdigit() else None
 
-# تنظیمات پروکسی (اختیاری - برای Render خالی بگذارید)
 PROXY_HOST = os.getenv("PROXY_HOST", "").strip()
 PROXY_PORT = int(os.getenv("PROXY_PORT", "0") or 0)
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 MAX_MUTE_SECONDS = 366 * 86400
+DEFAULT_MAX_WARNINGS = 3
 
-# لیست همه ادمین‌های ارشد
 SUPER_ADMINS = [uid for uid in (OWNER_ID, SECOND_ADMIN_ID) if uid]
+
+# ═════════════════════════════════════════════
+# تنظیمات قابلیت واسطه
+# ═════════════════════════════════════════════
+MEDIATOR_CHAT_ID = 1004337969779
+MEDIATOR_KEYWORD = "واسطه"
+MEDIATOR_USERNAMES = ["@mAMmA2222", "@mamad_slayer"]
+MEDIATOR_COOLDOWN_SECONDS = 30
+
+_MEDIATOR_COOLDOWN = {}
 
 
 # ═════════════════════════════════════════════
@@ -77,14 +86,12 @@ logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 
 # ═════════════════════════════════════════════
-# ۳) ساخت کلاینت تلگرام (با/بدون پروکسی)
+# ۳) ساخت کلاینت تلگرام
 # ═════════════════════════════════════════════
 if PROXY_HOST and PROXY_PORT:
     logger.info(f"🌐 اتصال از طریق پروکسی SOCKS5: {PROXY_HOST}:{PROXY_PORT}")
     client = TelegramClient(
-        SESSION_NAME,
-        API_ID,
-        API_HASH,
+        SESSION_NAME, API_ID, API_HASH,
         proxy=(socks.SOCKS5, PROXY_HOST, PROXY_PORT, True, None, None),
     )
 else:
@@ -96,8 +103,6 @@ else:
 # ۴) کلاس مدیریت دیتابیس PostgreSQL
 # ═════════════════════════════════════════════
 class Database:
-    """مدیریت دیتابیس PostgreSQL"""
-
     def __init__(self, db_url: str):
         if not db_url:
             raise ValueError("❌ DATABASE_URL تنظیم نشده است.")
@@ -144,6 +149,16 @@ class Database:
                 );
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS warnings (
+                    user_id        BIGINT NOT NULL,
+                    group_id       BIGINT NOT NULL,
+                    count          INTEGER DEFAULT 0,
+                    last_warned_by BIGINT,
+                    last_warned_at TEXT,
+                    PRIMARY KEY (user_id, group_id)
+                );
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS logs (
                     id        SERIAL PRIMARY KEY,
                     action    TEXT NOT NULL,
@@ -161,7 +176,6 @@ class Database:
                 );
             """)
 
-    # ───────────── ادمین‌ها ─────────────
     def add_admin(self, user_id, group_id, added_by):
         with self._cursor() as cur:
             cur.execute("""
@@ -173,10 +187,7 @@ class Database:
 
     def remove_admin(self, user_id, group_id):
         with self._cursor() as cur:
-            cur.execute(
-                "DELETE FROM admins WHERE user_id=%s AND group_id=%s",
-                (user_id, group_id),
-            )
+            cur.execute("DELETE FROM admins WHERE user_id=%s AND group_id=%s", (user_id, group_id))
             return cur.rowcount > 0
 
     def is_admin(self, user_id, group_id):
@@ -190,10 +201,7 @@ class Database:
     def get_admins(self, group_id=None):
         with self._cursor() as cur:
             if group_id is not None:
-                cur.execute(
-                    "SELECT * FROM admins WHERE group_id=%s ORDER BY added_at DESC",
-                    (group_id,),
-                )
+                cur.execute("SELECT * FROM admins WHERE group_id=%s ORDER BY added_at DESC", (group_id,))
             else:
                 cur.execute("SELECT * FROM admins ORDER BY added_at DESC")
             return [dict(r) for r in cur.fetchall()]
@@ -203,7 +211,6 @@ class Database:
             cur.execute("SELECT COUNT(*) AS c FROM admins")
             return cur.fetchone()["c"]
 
-    # ───────────── بن ─────────────
     def add_ban(self, user_id, group_id, reason, banned_by):
         with self._cursor() as cur:
             cur.execute("""
@@ -216,22 +223,14 @@ class Database:
 
     def remove_ban(self, user_id, group_id):
         with self._cursor() as cur:
-            cur.execute(
-                "UPDATE bans SET is_active=0 WHERE user_id=%s AND group_id=%s",
-                (user_id, group_id),
-            )
+            cur.execute("UPDATE bans SET is_active=0 WHERE user_id=%s AND group_id=%s", (user_id, group_id))
 
     def get_bans(self, group_id=None):
         with self._cursor() as cur:
             if group_id is not None:
-                cur.execute(
-                    "SELECT * FROM bans WHERE group_id=%s AND is_active=1 ORDER BY banned_at DESC",
-                    (group_id,),
-                )
+                cur.execute("SELECT * FROM bans WHERE group_id=%s AND is_active=1 ORDER BY banned_at DESC", (group_id,))
             else:
-                cur.execute(
-                    "SELECT * FROM bans WHERE is_active=1 ORDER BY banned_at DESC"
-                )
+                cur.execute("SELECT * FROM bans WHERE is_active=1 ORDER BY banned_at DESC")
             return [dict(r) for r in cur.fetchall()]
 
     def count_bans(self):
@@ -239,7 +238,6 @@ class Database:
             cur.execute("SELECT COUNT(*) AS c FROM bans WHERE is_active=1")
             return cur.fetchone()["c"]
 
-    # ───────────── میوت ─────────────
     def add_mute(self, user_id, group_id, reason, muted_by, until_iso):
         with self._cursor() as cur:
             cur.execute("""
@@ -252,22 +250,14 @@ class Database:
 
     def remove_mute(self, user_id, group_id):
         with self._cursor() as cur:
-            cur.execute(
-                "UPDATE mutes SET is_active=0 WHERE user_id=%s AND group_id=%s",
-                (user_id, group_id),
-            )
+            cur.execute("UPDATE mutes SET is_active=0 WHERE user_id=%s AND group_id=%s", (user_id, group_id))
 
     def get_mutes(self, group_id=None):
         with self._cursor() as cur:
             if group_id is not None:
-                cur.execute(
-                    "SELECT * FROM mutes WHERE group_id=%s AND is_active=1 ORDER BY muted_at DESC",
-                    (group_id,),
-                )
+                cur.execute("SELECT * FROM mutes WHERE group_id=%s AND is_active=1 ORDER BY muted_at DESC", (group_id,))
             else:
-                cur.execute(
-                    "SELECT * FROM mutes WHERE is_active=1 ORDER BY muted_at DESC"
-                )
+                cur.execute("SELECT * FROM mutes WHERE is_active=1 ORDER BY muted_at DESC")
             return [dict(r) for r in cur.fetchall()]
 
     def count_mutes(self):
@@ -279,12 +269,47 @@ class Database:
         now = datetime.now(IRAN_TZ).isoformat()
         with self._cursor() as cur:
             cur.execute(
-                "UPDATE mutes SET is_active=0 "
-                "WHERE is_active=1 AND until IS NOT NULL AND until < %s",
+                "UPDATE mutes SET is_active=0 WHERE is_active=1 AND until IS NOT NULL AND until < %s",
                 (now,),
             )
 
-    # ───────────── لاگ ─────────────
+    def add_warning(self, user_id, group_id, warned_by):
+        with self._cursor() as cur:
+            cur.execute("""
+                INSERT INTO warnings (user_id, group_id, count, last_warned_by, last_warned_at)
+                VALUES (%s, %s, 1, %s, %s)
+                ON CONFLICT (user_id, group_id) DO UPDATE
+                SET count = warnings.count + 1,
+                    last_warned_by = EXCLUDED.last_warned_by,
+                    last_warned_at = EXCLUDED.last_warned_at
+            """, (user_id, group_id, warned_by, datetime.now(IRAN_TZ).isoformat()))
+            cur.execute("SELECT count FROM warnings WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+            row = cur.fetchone()
+            return row["count"] if row else 0
+
+    def remove_warning(self, user_id, group_id):
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM warnings WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+
+    def get_warning_count(self, user_id, group_id):
+        with self._cursor() as cur:
+            cur.execute("SELECT count FROM warnings WHERE user_id=%s AND group_id=%s", (user_id, group_id))
+            row = cur.fetchone()
+            return row["count"] if row else 0
+
+    def get_warnings(self, group_id=None):
+        with self._cursor() as cur:
+            if group_id is not None:
+                cur.execute("SELECT * FROM warnings WHERE group_id=%s AND count>0 ORDER BY last_warned_at DESC", (group_id,))
+            else:
+                cur.execute("SELECT * FROM warnings WHERE count>0 ORDER BY last_warned_at DESC")
+            return [dict(r) for r in cur.fetchall()]
+
+    def count_warnings(self):
+        with self._cursor() as cur:
+            cur.execute("SELECT COALESCE(SUM(count), 0) AS c FROM warnings WHERE count>0")
+            return cur.fetchone()["c"]
+
     def add_log(self, action, target_id, admin_id, group_id, reason):
         with self._cursor() as cur:
             cur.execute("""
@@ -297,7 +322,6 @@ class Database:
             cur.execute("SELECT COUNT(*) AS c FROM logs")
             return cur.fetchone()["c"]
 
-    # ───────────── تنظیمات ─────────────
     def set_setting(self, key, value):
         with self._cursor() as cur:
             cur.execute("""
@@ -348,11 +372,11 @@ PREMIUM_EMOJI = {
     "list": "5447410659077661506",
     "shield": "5397782960512444700",
     "clock": "5458603043203327669",
+    "handshake": "5447410659077661506",
 }
 
 
 def prem(key: str, fallback: str) -> str:
-    """تبدیل یک ایموجی معمولی به ایموجی پرمیوم"""
     emoji_id = PREMIUM_EMOJI.get(key)
     if emoji_id:
         return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
@@ -363,8 +387,10 @@ def prem(key: str, fallback: str) -> str:
 # ۶) توابع کمکی
 # ═════════════════════════════════════════════
 COMMAND_KEYWORDS = {
+    "unwarn": ["unwarn", "removewarn", "حذف اخطار", "حذف هشدار", "رفع اخطار"],
     "unmute": ["unmute", "آنمیوت", "آن میوت", "انمیوت", "ان میوت"],
     "unban": ["unban", "آنبن", "آن بن", "انبن", "ان بن"],
+    "warn": ["warn", "اخطار", "هشدار"],
     "mute": ["mute", "silence", "سکوت", "میوت"],
     "ban": ["ban", "مسدود", "بن"],
 }
@@ -375,7 +401,7 @@ def parse_command(text):
         return None
     raw = text.strip()
     lower = raw.lower()
-    for cmd in ("unmute", "unban", "mute", "ban"):
+    for cmd in ("unwarn", "unmute", "unban", "warn", "mute", "ban"):
         for kw in COMMAND_KEYWORDS[cmd]:
             k = kw.lower()
             if lower.startswith(k):
@@ -386,22 +412,40 @@ def parse_command(text):
 
 
 def parse_duration(text):
+    """
+    تشخیص مدت زمان و دلیل.
+    خروجی: (seconds, reason)
+
+    قوانین:
+    - «20» یا «555» → بدون واحد، پیش‌فرض دقیقه
+    - «20m» / «2h» / «1d» / «30s» → با واحد مشخص
+    - «20 تبلیغ» / «555 اسپم» → عدد بدون واحد + دلیل
+    - «20m اسپم» / «2h تبلیغ» → عدد با واحد + دلیل
+    - «اسپم» → بدون عدد، ۱ ساعت پیش‌فرض + دلیل
+    """
     text = (text or "").strip()
     if not text:
         return 3600, ""
-    m = re.match(r"^(\d+)\s*([smhdSMHD])(?:\s+(.*))?$", text, re.DOTALL)
+
+    # جدا کردن اولین توکن از بقیه متن
+    parts = text.split(None, 1)
+    first = parts[0]
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    # بررسی: آیا اولین توکن یک عدد با/بدون واحد است؟
+    m = re.match(r"^(\d+)([smhdSMHD])?$", first)
     if m:
-        try:
-            num = int(m.group(1))
-        except ValueError:
-            return 3600, text
-        unit = m.group(2).lower()
-        reason = (m.group(3) or "").strip()
+        num = int(m.group(1))
+        unit = (m.group(2) or "m").lower()  # پیش‌فرض: دقیقه
         mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
         seconds = num * mult
         if seconds > MAX_MUTE_SECONDS:
             seconds = MAX_MUTE_SECONDS
-        return seconds, reason
+        if seconds <= 0:
+            seconds = 60  # حداقل ۱ دقیقه
+        return seconds, rest
+
+    # بدون عدد → کل متن دلیل، ۱ ساعت پیش‌فرض
     return 3600, text
 
 
@@ -448,7 +492,7 @@ def build_message_link(chat_id, message_id):
 
 
 def format_report(action_title, action_emoji_key, target, admin_user, chat, reason, link):
-    """ساخت متن زیبای گزارش عملیات با ایموجی پرمیوم و لینک‌های کلیک‌پذیر"""
+    """گزارش زیبا با لینک‌های کلیک‌پذیر"""
     target_name = user_display(target)
     target_username = getattr(target, "username", None)
     target_id_link = f'<a href="tg://user?id={target.id}">{target.id}</a>'
@@ -505,9 +549,7 @@ def format_report(action_title, action_emoji_key, target, admin_user, chat, reas
 async def is_telegram_admin(chat_id, user_id):
     try:
         p = await client(GetParticipantRequest(chat_id, user_id))
-        return isinstance(
-            p.participant, (ChannelParticipantCreator, ChannelParticipantAdmin)
-        )
+        return isinstance(p.participant, (ChannelParticipantCreator, ChannelParticipantAdmin))
     except Exception:
         return False
 
@@ -535,11 +577,17 @@ async def get_reply_target(event):
         return None
 
 
+def is_mediator_group(chat_id):
+    try:
+        return abs(int(chat_id)) == MEDIATOR_CHAT_ID
+    except Exception:
+        return False
+
+
 # ═════════════════════════════════════════════
-# ۷) ارسال گزارش به همه ادمین‌های ارشد
+# ۷) ارسال گزارش
 # ═════════════════════════════════════════════
 async def send_report(text):
-    """ارسال گزارش به مالک، ادمین دوم و کانال لاگ"""
     for admin_id in SUPER_ADMINS:
         try:
             await client.send_message(admin_id, text, parse_mode="html", link_preview=False)
@@ -548,15 +596,105 @@ async def send_report(text):
 
     if LOG_CHANNEL_ID:
         try:
-            await client.send_message(
-                LOG_CHANNEL_ID, text, parse_mode="html", link_preview=False
-            )
+            await client.send_message(LOG_CHANNEL_ID, text, parse_mode="html", link_preview=False)
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش به کانال: {ex}")
 
 
 # ═════════════════════════════════════════════
-# ۸) ضد اسپم و ضد لینک
+# ۸) سیستم واسطه خودکار
+# ═════════════════════════════════════════════
+async def handle_mediator_request(event, chat, sender):
+    now_ts = datetime.now(timezone.utc).timestamp()
+    uid = sender.id if sender else event.sender_id
+
+    last_ts = _MEDIATOR_COOLDOWN.get(uid)
+    if last_ts and (now_ts - last_ts) < MEDIATOR_COOLDOWN_SECONDS:
+        remaining = int(MEDIATOR_COOLDOWN_SECONDS - (now_ts - last_ts))
+        try:
+            await event.reply(
+                f"{prem('warning', '⏳')} <b>لطفاً {remaining} ثانیه دیگر دوباره تلاش کنید.</b>",
+                parse_mode="html",
+            )
+        except Exception:
+            pass
+        return
+    _MEDIATOR_COOLDOWN[uid] = now_ts
+
+    sender_name = user_display(sender) if sender else "ناشناس"
+    sender_username = getattr(sender, "username", None) if sender else None
+    sender_id_link = f'<a href="tg://user?id={uid}">{uid}</a>'
+    sender_username_link = (
+        f'<a href="https://t.me/{sender_username}">@{sender_username}</a>'
+        if sender_username else "—"
+    )
+
+    group_reply = (
+        "╔══════════════════════════════════╗\n"
+        f"   {prem('handshake', '🤝')} <b>درخواست واسطه ثبت شد</b> {prem('handshake', '🤝')}\n"
+        "╚══════════════════════════════════╝\n\n"
+        "┏━━━ 👤 <b>درخواست‌دهنده</b> ━━━┓\n"
+        f"┃ 🏷️ <b>نام:</b> {h(sender_name)}\n"
+        f"┃ {prem('id', '🆔')} <b>آیدی:</b> {sender_id_link}\n"
+        f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {sender_username_link}\n"
+        "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        f"{prem('star', '⭐')} <b>واسطه‌های رسمی:</b>\n"
+        f"┃ 👤 {MEDIATOR_USERNAMES[0]}\n"
+        f"┃ 👤 {MEDIATOR_USERNAMES[1]}\n\n"
+        f"{prem('clock', '⏱')} <b>لطفاً صبر کنید...</b>\n"
+        "به‌زودی یکی از واسطه‌ها با شما تماس می‌گیرد. ✅"
+    )
+    try:
+        await event.reply(group_reply, parse_mode="html")
+    except Exception as ex:
+        logger.error(f"خطا در ارسال پیام واسطه در گروه: {ex}")
+
+    chat_title = getattr(chat, "title", "—") or "—"
+    chat_username = getattr(chat, "username", None)
+    chat_title_txt = (
+        f'<a href="https://t.me/{chat_username}">{h(chat_title)}</a>'
+        if chat_username else h(chat_title)
+    )
+    link = build_message_link(chat.id, event.id)
+
+    admin_msg = (
+        "╔══════════════════════════════════╗\n"
+        f"   {prem('warning', '🚨')} <b>درخواست واسطه جدید</b> {prem('warning', '🚨')}\n"
+        "╚══════════════════════════════════╝\n\n"
+        f"◆ {prem('fire', '🔥')} <b>نوع:</b> درخواست واسطه\n"
+        f"◆ {prem('time', '⏱')} <b>زمان:</b> <code>{now_iran_str()}</code>\n\n"
+        "┏━━━ 👤 <b>درخواست‌دهنده</b> ━━━┓\n"
+        f"┃ 🏷️ <b>نام:</b> {h(sender_name)}\n"
+        f"┃ {prem('id', '🆔')} <b>آیدی:</b> {sender_id_link}\n"
+        f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {sender_username_link}\n"
+        "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        "┏━━━ 📌 <b>گروه</b> ━━━┓\n"
+        f"┃ 🏷️ <b>نام:</b> {chat_title_txt}\n"
+        f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{chat.id}</code>\n"
+        f"┃ {prem('link', '🔗')} <b>لینک پیام:</b> "
+        f"{f'<a href=\"{link}\">اینجا کلیک کنید</a>' if link else '—'}\n"
+        "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        f"{prem('warning', '⚠️')} <b>لطفاً در اسرع وقت بررسی کنید.</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 <i>Group Manager Bot</i>"
+    )
+    for admin_id in SUPER_ADMINS:
+        try:
+            await client.send_message(admin_id, admin_msg, parse_mode="html", link_preview=False)
+        except Exception as ex:
+            logger.error(f"خطا در ارسال گزارش واسطه به {admin_id}: {ex}")
+
+    if LOG_CHANNEL_ID:
+        try:
+            await client.send_message(LOG_CHANNEL_ID, admin_msg, parse_mode="html", link_preview=False)
+        except Exception as ex:
+            logger.error(f"خطا در ارسال گزارش واسطه به کانال: {ex}")
+
+    db.add_log("mediator-request", uid, 0, chat.id, "درخواست واسطه")
+
+
+# ═════════════════════════════════════════════
+# ۹) ضد اسپم و ضد لینک
 # ═════════════════════════════════════════════
 _SPAM_TRACKER = defaultdict(lambda: deque(maxlen=20))
 SPAM_THRESHOLD = 6
@@ -570,6 +708,8 @@ async def check_antispam(event, chat, sender):
     if not db.get_bool_setting("anti_spam", False):
         return
     if sender is None or getattr(sender, "bot", False):
+        return
+    if await is_admin_or_owner(chat.id, sender.id):
         return
     now = datetime.now(timezone.utc).timestamp()
     key = (chat.id, sender.id)
@@ -617,7 +757,7 @@ async def check_antilink(event, chat, sender):
 
 
 # ═════════════════════════════════════════════
-# ۹) اجرای عملیات
+# ۱۰) اجرای عملیات
 # ═════════════════════════════════════════════
 def _full_ban_rights():
     return ChatBannedRights(
@@ -689,11 +829,12 @@ async def do_unban(event, chat, target, reason, admin_user):
 
     db.remove_ban(target.id, chat.id)
     db.remove_mute(target.id, chat.id)
+    db.remove_warning(target.id, chat.id)
     db.add_log("unban", target.id, admin_user.id, chat.id, reason or "")
 
     reason_txt = f"\n{prem('reason', '💬')} <b>دلیل:</b> {h(reason)}" if reason else ""
     await event.reply(
-        f"{prem('unban', '✅')} <b>کاربر {h(user_display(target))} آنبن شد.</b>{reason_txt}",
+        f"{prem('unban', '✅')} <b>کاربر {h(user_display(target))} آنبن شد و اخطارهایش پاک شد.</b>{reason_txt}",
         parse_mode="html",
     )
 
@@ -774,8 +915,93 @@ async def do_unmute(event, chat, target, reason, admin_user):
     await send_report(report)
 
 
+async def do_warn(event, chat, target, reason, admin_user):
+    try:
+        max_warns = int(db.get_setting("max_warnings", str(DEFAULT_MAX_WARNINGS)) or DEFAULT_MAX_WARNINGS)
+    except Exception:
+        max_warns = DEFAULT_MAX_WARNINGS
+
+    new_count = db.add_warning(target.id, chat.id, admin_user.id)
+    db.add_log("warn", target.id, admin_user.id, chat.id, reason or "")
+
+    if new_count >= max_warns:
+        ban_success = False
+        try:
+            await client(EditBannedRequest(chat.id, target.id, _full_ban_rights()))
+            ban_success = True
+        except (ChatAdminRequiredError, UserAdminInvalidError):
+            ban_success = False
+        except Exception as ex:
+            logger.exception(f"خطا در بن خودکار: {ex}")
+            ban_success = False
+
+        if ban_success:
+            db.remove_warning(target.id, chat.id)
+            db.add_ban(target.id, chat.id, f"بن خودکار پس از {max_warns} اخطار" + (f" - {reason}" if reason else ""), admin_user.id)
+            db.add_log("auto-ban", target.id, admin_user.id, chat.id, f"پس از {max_warns} اخطار")
+
+            await event.reply(
+                f"{prem('ban', '🚫')} <b>کاربر {h(user_display(target))} به دلیل رسیدن به "
+                f"{max_warns} اخطار، به صورت خودکار بن شد!</b>",
+                parse_mode="html",
+            )
+
+            link = build_message_link(chat.id, event.reply_to_msg_id or event.id)
+            full_reason = f"بن خودکار پس از {max_warns} اخطار" + (f" - {reason}" if reason else "")
+            report = format_report(
+                f"اخطار {max_warns}ام و بن خودکار", "ban", target, admin_user, chat, full_reason, link,
+            )
+            await send_report(report)
+        else:
+            await event.reply(
+                f"{prem('warning', '⚠️')} <b>کاربر {h(user_display(target))} به {max_warns} اخطار رسید، "
+                f"اما ربات نتوانست او را بن کند (دسترسی کافی ندارد).</b>",
+                parse_mode="html",
+            )
+    else:
+        remaining = max_warns - new_count
+        reason_txt = f"\n┃ {prem('reason', '💬')} <b>دلیل:</b> {h(reason)}" if reason else ""
+        await event.reply(
+            "┏━━━ " + prem('warning', '⚠️') + " <b>اخطار جدید</b> ━━━┓\n"
+            f"┃ {prem('user', '👤')} <b>کاربر:</b> {h(user_display(target))}\n"
+            f"┃ 📊 <b>اخطارها:</b> <code>{new_count}/{max_warns}</code>\n"
+            f"┃ ⏳ <b>تا بن خودکار:</b> <code>{remaining}</code> اخطار دیگر"
+            f"{reason_txt}\n"
+            "┗━━━━━━━━━━━━━━━━━━━━┛",
+            parse_mode="html",
+        )
+
+        link = build_message_link(chat.id, event.reply_to_msg_id or event.id)
+        full_reason = f"اخطار {new_count}/{max_warns}" + (f" - {reason}" if reason else "")
+        report = format_report(
+            f"اخطار دادن به کاربر ({new_count}/{max_warns})",
+            "warning", target, admin_user, chat, full_reason, link,
+        )
+        await send_report(report)
+
+
+async def do_unwarn(event, chat, target, reason, admin_user):
+    prev_count = db.get_warning_count(target.id, chat.id)
+    db.remove_warning(target.id, chat.id)
+    db.add_log("unwarn", target.id, admin_user.id, chat.id, reason or "")
+
+    reason_txt = f"\n{prem('reason', '💬')} <b>دلیل:</b> {h(reason)}" if reason else ""
+    await event.reply(
+        f"{prem('check', '✅')} <b>اخطارهای کاربر {h(user_display(target))} پاک شد.</b>\n"
+        f"┃ 📊 <b>اخطارهای پاک شده:</b> <code>{prev_count}</code>{reason_txt}",
+        parse_mode="html",
+    )
+
+    link = build_message_link(chat.id, event.reply_to_msg_id or event.id)
+    report = format_report(
+        f"حذف اخطار کاربر (قبلاً {prev_count} اخطار)",
+        "check", target, admin_user, chat, reason, link,
+    )
+    await send_report(report)
+
+
 # ═════════════════════════════════════════════
-# ۱۰) هندلر اصلی گروه
+# ۱۱) هندلر اصلی گروه
 # ═════════════════════════════════════════════
 async def group_handler(event):
     try:
@@ -789,28 +1015,46 @@ async def group_handler(event):
         if event.sender_id == me.id:
             return
 
+        raw_text = (event.raw_text or "").strip()
+
+        # ═══ اول: بررسی درخواست واسطه ═══
+        if is_mediator_group(chat.id) and MEDIATOR_KEYWORD in raw_text:
+            try:
+                sender = await event.get_sender()
+            except Exception:
+                sender = None
+            await handle_mediator_request(event, chat, sender)
+            return
+
+        # ═══ دوم: بررسی ادمین بودن ═══
+        is_admin = await is_admin_or_owner(chat.id, event.sender_id)
+
+        if not is_admin:
+            try:
+                sender = await event.get_sender()
+                if sender and not getattr(sender, "bot", False):
+                    try:
+                        await check_antilink(event, chat, sender)
+                    except Exception as ex:
+                        logger.debug(f"antilink error: {ex}")
+                    try:
+                        await check_antispam(event, chat, sender)
+                    except Exception as ex:
+                        logger.debug(f"antispam error: {ex}")
+            except Exception:
+                pass
+            return
+
+        # ═══ از اینجا: فقط ادمین‌ها ═══
         try:
             sender = await event.get_sender()
         except Exception:
             sender = None
 
-        if sender is not None and not getattr(sender, "bot", False):
-            try:
-                await check_antilink(event, chat, sender)
-            except Exception as ex:
-                logger.debug(f"antilink error: {ex}")
-            try:
-                await check_antispam(event, chat, sender)
-            except Exception as ex:
-                logger.debug(f"antispam error: {ex}")
-
-        parsed = parse_command(event.raw_text or "")
+        parsed = parse_command(raw_text)
         if not parsed:
             return
         cmd, rest = parsed
-
-        if not await is_admin_or_owner(chat.id, event.sender_id):
-            return
 
         target = await get_reply_target(event)
         if target is None:
@@ -829,15 +1073,59 @@ async def group_handler(event):
 
         admin_user = sender if sender is not None else await event.get_sender()
 
+        # ─── بن: دلیل اجباری ───
         if cmd == "ban":
+            if not rest:
+                await event.reply(
+                    f"{prem('warning', '⚠️')} <b>برای بن کردن کاربر، حتماً باید دلیل بنویسید.</b>\n\n"
+                    f"📌 <b>مثال:</b>\n"
+                    f"┃ <code>بن تبلیغات</code>\n"
+                    f"┃ <code>بن ارسال لینک</code>\n"
+                    f"┃ <code>بن اسپم</code>",
+                    parse_mode="html",
+                )
+                return
             await do_ban(event, chat, target, rest, admin_user)
+
         elif cmd == "unban":
             await do_unban(event, chat, target, rest, admin_user)
+
+        # ─── سکوت: دلیل اجباری ───
         elif cmd == "mute":
             seconds, reason = parse_duration(rest)
+            if not reason:
+                await event.reply(
+                    f"{prem('warning', '⚠️')} <b>برای سکوت کردن کاربر، حتماً باید دلیل بنویسید.</b>\n\n"
+                    f"📌 <b>مثال‌ها:</b>\n"
+                    f"┃ <code>سکوت 30m اسپم</code>\n"
+                    f"┃ <code>سکوت 2h تبلیغات</code>\n"
+                    f"┃ <code>سکوت 20 ارسال لینک</code> <i>(۲۰ دقیقه)</i>\n"
+                    f"┃ <code>سکوت 555 تبلیغ</code> <i>(۵۵۵ دقیقه)</i>\n"
+                    f"┃ <code>سکوت 1d بی‌احترامی</code>",
+                    parse_mode="html",
+                )
+                return
             await do_mute(event, chat, target, reason, admin_user, seconds)
+
         elif cmd == "unmute":
             await do_unmute(event, chat, target, rest, admin_user)
+
+        # ─── اخطار: دلیل اجباری ───
+        elif cmd == "warn":
+            if not rest:
+                await event.reply(
+                    f"{prem('warning', '⚠️')} <b>برای اخطار دادن، حتماً باید دلیل بنویسید.</b>\n\n"
+                    f"📌 <b>مثال:</b>\n"
+                    f"┃ <code>اخطار تبلیغات</code>\n"
+                    f"┃ <code>اخطار بی‌احترامی</code>\n"
+                    f"┃ <code>اخطار اسپم</code>",
+                    parse_mode="html",
+                )
+                return
+            await do_warn(event, chat, target, rest, admin_user)
+
+        elif cmd == "unwarn":
+            await do_unwarn(event, chat, target, rest, admin_user)
 
     except Exception as ex:
         logger.exception(f"خطا در group_handler: {ex}")
@@ -848,7 +1136,7 @@ client.add_event_handler(group_handler, events.MessageEdited())
 
 
 # ═════════════════════════════════════════════
-# ۱۱) هندلر /start در پیوی
+# ۱۲) هندلر /start در پیوی
 # ═════════════════════════════════════════════
 MAIN_MENU_TEXT = (
     "╔══════════════════════════════════╗\n"
@@ -861,7 +1149,9 @@ MAIN_MENU_TEXT = (
     f"┃ {prem('unban', '✅')} آنبن کردن کاربر\n"
     f"┃ {prem('mute', '🔇')} میوت کردن کاربر\n"
     f"┃ {prem('unmute', '🔊')} آن‌میوت کردن کاربر\n"
+    f"┃ {prem('warning', '⚠️')} اخطار و بن خودکار\n"
     f"┃ {prem('shield', '🛡')} مدیریت ادمین‌ها\n"
+    f"┃ 🤝 درخواست واسطه خودکار\n"
     f"┃ 🚨 ضد اسپم و ضد لینک\n\n"
     "از دکمه‌های زیر استفاده کنید:"
 )
@@ -872,6 +1162,7 @@ MAIN_MENU_BUTTONS = [
         Button.inline("📋 لیست بن‌شده‌ها", data=b"bans"),
         Button.inline("🔇 لیست میوت‌شده‌ها", data=b"mutes"),
     ],
+    [Button.inline("⚠️ لیست اخطارها", data=b"warns")],
     [Button.inline("🛡 مدیریت ادمین‌ها", data=b"admins")],
     [Button.inline("📖 راهنمای دستورات", data=b"help")],
     [Button.inline("⚙️ تنظیمات", data=b"settings")],
@@ -882,9 +1173,7 @@ MAIN_MENU_BUTTONS = [
 async def cmd_start(event):
     try:
         if event.sender_id in SUPER_ADMINS:
-            await event.respond(
-                MAIN_MENU_TEXT, buttons=MAIN_MENU_BUTTONS, parse_mode="html"
-            )
+            await event.respond(MAIN_MENU_TEXT, buttons=MAIN_MENU_BUTTONS, parse_mode="html")
         else:
             await event.respond(
                 "👋 <b>سلام!</b>\n\n"
@@ -892,8 +1181,8 @@ async def cmd_start(event):
                 "برای استفاده از من، مرا به گروه خود اضافه کنید و "
                 "به عنوان ادمین تنظیم کنید.\n\n"
                 "🔹 سپس با ریپلای روی پیام کاربران، از دستورات "
-                "<code>بن</code>، <code>سکوت</code>، <code>آنبن</code> و "
-                "<code>آن‌میوت</code> استفاده کنید.",
+                "<code>بن</code>، <code>سکوت</code>، <code>اخطار</code>، "
+                "<code>آنبن</code> و <code>آن‌میوت</code> استفاده کنید.",
                 parse_mode="html",
             )
     except Exception as ex:
@@ -901,7 +1190,7 @@ async def cmd_start(event):
 
 
 # ═════════════════════════════════════════════
-# ۱۲) هندلر دکمه‌های شیشه‌ای
+# ۱۳) هندلر دکمه‌های شیشه‌ای
 # ═════════════════════════════════════════════
 @client.on(events.CallbackQuery)
 async def on_callback(event):
@@ -923,6 +1212,9 @@ async def on_callback(event):
             await event.answer()
         elif data == "mutes":
             await cb_mutes(event)
+            await event.answer()
+        elif data == "warns":
+            await cb_warns(event)
             await event.answer()
         elif data == "admins":
             await cb_admins(event)
@@ -958,6 +1250,7 @@ async def on_callback(event):
 
 async def cb_stats(event):
     db.cleanup_expired_mutes()
+    max_warns = db.get_setting("max_warnings", str(DEFAULT_MAX_WARNINGS)) or str(DEFAULT_MAX_WARNINGS)
     text = (
         "╔══════════════════════════════════╗\n"
         f"   {prem('stats', '📊')} <b>آمار کلی ربات</b> {prem('stats', '📊')}\n"
@@ -965,8 +1258,10 @@ async def cb_stats(event):
         f"┏━━━ {prem('fire', '🔥')} <b>وضعیت ربات</b> ━━━┓\n"
         f"┃ {prem('ban', '🚫')} <b>بن‌های فعال:</b> <code>{db.count_bans()}</code>\n"
         f"┃ {prem('mute', '🔇')} <b>میوت‌های فعال:</b> <code>{db.count_mutes()}</code>\n"
+        f"┃ {prem('warning', '⚠️')} <b>کل اخطارها:</b> <code>{db.count_warnings()}</code>\n"
         f"┃ {prem('admin', '🛡')} <b>ادمین‌های ثبت‌شده:</b> <code>{db.count_admins()}</code>\n"
         f"┃ 📝 <b>تعداد کل لاگ‌ها:</b> <code>{db.count_logs()}</code>\n"
+        f"┃ 🎯 <b>سقف اخطار:</b> <code>{max_warns}</code>\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
         f"{prem('time', '⏱')} <b>آخرین بروزرسانی:</b>\n<code>{now_iran_str()}</code>"
     )
@@ -1032,6 +1327,42 @@ async def cb_mutes(event):
     await event.edit(text, buttons=[[Button.inline("🔙 بازگشت", data=b"back")]], parse_mode="html")
 
 
+async def cb_warns(event):
+    rows = db.get_warnings()[:25]
+    max_warns = db.get_setting("max_warnings", str(DEFAULT_MAX_WARNINGS)) or str(DEFAULT_MAX_WARNINGS)
+    if not rows:
+        text = (
+            "╔══════════════════════════════════╗\n"
+            f"   {prem('warning', '⚠️')} <b>لیست اخطارها</b>\n"
+            "╚══════════════════════════════════╝\n\n"
+            f"{prem('check', '✅')} <i>هیچ کاربری اخطار فعال ندارد.</i>"
+        )
+    else:
+        lines = [
+            "╔══════════════════════════════════╗",
+            f"   {prem('warning', '⚠️')} <b>لیست اخطارها</b> ({len(rows)})",
+            "╚══════════════════════════════════╝\n",
+            f"🎯 <b>سقف اخطار:</b> <code>{max_warns}</code>\n",
+        ]
+        for i, r in enumerate(rows, 1):
+            user_link = f'<a href="tg://user?id={r["user_id"]}">{r["user_id"]}</a>'
+            count = r["count"] or 0
+            bar_total = 10
+            filled = min(bar_total, int((count / int(max_warns)) * bar_total)) if max_warns else 0
+            bar = "█" * filled + "░" * (bar_total - filled)
+            lines.append(
+                f"{prem('fire', '🔥')} <b>#{i}</b>\n"
+                f"┃ {prem('user', '👤')} <b>آیدی:</b> {user_link}\n"
+                f"┃ {prem('group', '📌')} <b>گروه:</b> <code>{r['group_id']}</code>\n"
+                f"┃ 📊 <b>اخطار:</b> <code>{count}/{max_warns}</code>\n"
+                f"┃ <code>{bar}</code>\n"
+                f"┃ {prem('time', '⏱')} <b>آخرین:</b> {h((r['last_warned_at'] or '')[:19])}\n"
+                "━━━━━━━━━━━━━"
+            )
+        text = "\n".join(lines)
+    await event.edit(text, buttons=[[Button.inline("🔙 بازگشت", data=b"back")]], parse_mode="html")
+
+
 async def cb_admins(event):
     rows = db.get_admins()
     lines = [
@@ -1063,22 +1394,37 @@ async def cb_help(event):
         "╚══════════════════════════════════╝\n\n"
         "برای اجرای دستور، روی پیام کاربر هدف <b>ریپلای</b> بزنید:\n\n"
         f"┏━━━ {prem('ban', '🚫')} <b>بن کردن</b> ━━━┓\n"
-        "┃ <code>بن</code> | <code>ban</code> | <code>مسدود</code>\n"
+        "┃ <code>بن [دلیل]</code>\n"
         "┃ 🔹 مثال: <code>بن تبلیغات</code>\n"
+        "┃ ⚠️ بدون دلیل اجرا نمی‌شود\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
         f"┏━━━ {prem('unban', '✅')} <b>آنبن کردن</b> ━━━┓\n"
         "┃ <code>آنبن</code> | <code>unban</code>\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
         f"┏━━━ {prem('mute', '🔇')} <b>سکوت (میوت)</b> ━━━┓\n"
-        "┃ <code>سکوت 4h</code> | <code>mute 30m</code>\n"
-        "┃ 🔹 فرمت‌ها:\n"
-        "┃   <code>s</code> ثانیه | <code>m</code> دقیقه\n"
-        "┃   <code>h</code> ساعت | <code>d</code> روز\n"
-        "┃ 🔹 پیش‌فرض: ۱ ساعت\n"
-        "┃ 🔹 مثال: <code>سکوت 4h اسپم</code>\n"
+        "┃ <code>سکوت [زمان] [دلیل]</code>\n"
+        "┃ 🔹 مثال‌ها:\n"
+        "┃   <code>سکوت 20 اسپم</code> → ۲۰ دقیقه\n"
+        "┃   <code>سکوت 555 تبلیغ</code> → ۵۵۵ دقیقه\n"
+        "┃   <code>سکوت 30m اسپم</code> → ۳۰ دقیقه\n"
+        "┃   <code>سکوت 2h تبلیغ</code> → ۲ ساعت\n"
+        "┃   <code>سکوت 1d بی‌احترامی</code> → ۱ روز\n"
+        "┃ ⚠️ بدون دلیل اجرا نمی‌شود\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
         f"┏━━━ {prem('unmute', '🔊')} <b>آن‌میوت</b> ━━━┓\n"
         "┃ <code>آن‌میوت</code> | <code>unmute</code>\n"
+        "┗━━━━━━━━━━━━━━━┛\n\n"
+        f"┏━━━ {prem('warning', '⚠️')} <b>اخطار</b> ━━━┓\n"
+        "┃ <code>اخطار [دلیل]</code>\n"
+        "┃ 🔹 پس از <b>۳ اخطار</b> → بن خودکار\n"
+        "┃ ⚠️ بدون دلیل اجرا نمی‌شود\n"
+        "┗━━━━━━━━━━━━━━━┛\n\n"
+        f"┏━━━ {prem('check', '✔️')} <b>حذف اخطار</b> ━━━┓\n"
+        "┃ <code>حذف اخطار</code>\n"
+        "┗━━━━━━━━━━━━━━━┛\n\n"
+        f"┏━━━ {prem('handshake', '🤝')} <b>واسطه</b> ━━━┓\n"
+        f"┃ در گپ <code>{MEDIATOR_CHAT_ID}</code> بنویسید:\n"
+        "┃ <code>واسطه</code>\n"
         "┗━━━━━━━━━━━━━━━┛"
     )
     await event.edit(text, buttons=[[Button.inline("🔙 بازگشت", data=b"back")]], parse_mode="html")
@@ -1087,13 +1433,15 @@ async def cb_help(event):
 async def cb_settings(event):
     anti_spam = db.get_bool_setting("anti_spam", False)
     anti_link = db.get_bool_setting("anti_link", False)
+    max_warns = db.get_setting("max_warnings", str(DEFAULT_MAX_WARNINGS)) or str(DEFAULT_MAX_WARNINGS)
     text = (
         "╔══════════════════════════════════╗\n"
         f"   {prem('settings', '⚙️')} <b>تنظیمات ربات</b> {prem('settings', '⚙️')}\n"
         "╚══════════════════════════════════╝\n\n"
         f"{prem('fire', '🔥')} <b>قابلیت‌های حفاظتی:</b>\n\n"
         f"┃ 🚨 ضد اسپم: {'✅ روشن' if anti_spam else '❌ خاموش'}\n"
-        f"┃ 🔗 ضد لینک: {'✅ روشن' if anti_link else '❌ خاموش'}\n\n"
+        f"┃ 🔗 ضد لینک: {'✅ روشن' if anti_link else '❌ خاموش'}\n"
+        f"┃ {prem('warning', '⚠️')} سقف اخطار: <code>{max_warns}</code>\n\n"
         "برای تغییر، روی دکمه‌ها کلیک کنید:"
     )
     buttons = [
@@ -1105,7 +1453,7 @@ async def cb_settings(event):
 
 
 # ═════════════════════════════════════════════
-# ۱۳) دستورات مدیریتی در پیوی
+# ۱۴) دستورات مدیریتی در پیوی
 # ═════════════════════════════════════════════
 @client.on(events.NewMessage(
     pattern=r"^/addadmin\s+(-?\d+)(?:\s+(-?\d+))?$",
@@ -1152,10 +1500,14 @@ async def cmd_help(event):
         f"{prem('info', '📖')} <b>راهنمای ربات گروه‌بان</b>\n\n"
         "🔹 ربات را به گروه اضافه کنید و ادمین کنید.\n"
         "🔹 سپس روی پیام کاربر ریپلای بزنید و ارسال کنید:\n\n"
-        f"{prem('ban', '🚫')} <code>بن</code> - بن کردن\n"
-        f"{prem('unban', '✅')} <code>آنبن</code> - آنبن کردن\n"
-        f"{prem('mute', '🔇')} <code>سکوت 4h</code> - میوت کردن\n"
-        f"{prem('unmute', '🔊')} <code>آن‌میوت</code> - رفع میوت\n\n"
+        f"{prem('ban', '🚫')} <code>بن [دلیل]</code> - بن (دلیل اجباری)\n"
+        f"{prem('unban', '✅')} <code>آنبن</code> - آنبن\n"
+        f"{prem('mute', '🔇')} <code>سکوت [زمان] [دلیل]</code> - میوت (دلیل اجباری)\n"
+        f"{prem('unmute', '🔊')} <code>آن‌میوت</code> - رفع میوت\n"
+        f"{prem('warning', '⚠️')} <code>اخطار [دلیل]</code> - اخطار (دلیل اجباری)\n"
+        f"{prem('check', '✔️')} <code>حذف اخطار</code> - پاک کردن اخطارها\n\n"
+        f"{prem('handshake', '🤝')} <b>واسطه خودکار:</b>\n"
+        f"در گپ <code>{MEDIATOR_CHAT_ID}</code> کافیه بنویسید <code>واسطه</code>\n\n"
         f"{prem('time', '⏱')} {now_iran_str()}"
     )
     await event.respond(text, parse_mode="html")
@@ -1171,6 +1523,7 @@ async def cmd_stats(event):
         f"{prem('stats', '📊')} <b>آمار کلی ربات</b>\n\n"
         f"{prem('ban', '🚫')} بن‌های فعال: <code>{db.count_bans()}</code>\n"
         f"{prem('mute', '🔇')} میوت‌های فعال: <code>{db.count_mutes()}</code>\n"
+        f"{prem('warning', '⚠️')} کل اخطارها: <code>{db.count_warnings()}</code>\n"
         f"{prem('admin', '🛡')} ادمین‌ها: <code>{db.count_admins()}</code>\n"
         f"📝 لاگ‌ها: <code>{db.count_logs()}</code>\n\n"
         f"{prem('time', '⏱')} {now_iran_str()}"
@@ -1179,7 +1532,7 @@ async def cmd_stats(event):
 
 
 # ═════════════════════════════════════════════
-# ۱۴) وب‌سرور کوچک Flask برای Render (Web Service رایگان)
+# ۱۵) وب‌سرور Flask
 # ═════════════════════════════════════════════
 web_app = Flask(__name__)
 
@@ -1195,14 +1548,13 @@ def health():
 
 
 def run_web_server():
-    """اجرای وب‌سرور روی پورت Render (پیش‌فرض: 10000)"""
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🌐 وب‌سرور Flask روی پورت {port} اجرا شد")
     web_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 
 # ═════════════════════════════════════════════
-# ۱۵) راه‌اندازی ربات
+# ۱۶) راه‌اندازی ربات
 # ═════════════════════════════════════════════
 async def _periodic_cleanup():
     while True:
@@ -1227,7 +1579,6 @@ async def main():
     me = await client.get_me()
     logger.info(f"✅ ربات متصل شد: @{me.username} (ID: {me.id})")
 
-    # اعلان به همه ادمین‌های ارشد
     for admin_id in SUPER_ADMINS:
         try:
             await client.send_message(
@@ -1253,15 +1604,12 @@ async def main():
 
 
 # ═════════════════════════════════════════════
-# ۱۶) نقطه ورود برنامه (اجرای همزمان وب‌سرور + ربات)
+# ۱۷) نقطه ورود
 # ═════════════════════════════════════════════
 if __name__ == "__main__":
     try:
-        # وب‌سرور Flask را در یک thread جداگانه اجرا کن
         web_thread = threading.Thread(target=run_web_server, daemon=True)
         web_thread.start()
-
-        # ربات تلگرام را در thread اصلی اجرا کن
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("⛔ ربات توسط کاربر متوقف شد.")

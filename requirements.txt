@@ -2,4 +2,4 @@ telethon
 python-dotenv
 pysocks
 psycopg2-binary
-Flask
+Flask 
