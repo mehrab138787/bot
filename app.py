@@ -4,7 +4,7 @@
 ║         🤖  ربات مدیریت حرفه‌ای گروه‌های تلگرام  🤖           ║
 ║                    Group Manager Bot                         ║
 ║         Telethon + PostgreSQL + Flask + asyncio              ║
-║  ✨ ایموجی پرمیوم + واسطه + مدیریت گروه‌ها + سیستم پیروی ✨  ║
+║  ✨ ایموجی پرمیوم + واسطه + مدیریت گروه‌ها + صفحه‌بندی ✨   ║
 ║           🚀 آماده استقرار روی Render (Web Service)          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -77,6 +77,9 @@ MEDIATOR_COOLDOWN_SECONDS = 30
 
 _MEDIATOR_COOLDOWN = {}
 _MEDIATOR_REQUESTS = {}
+
+# تعداد ادمین در هر صفحه
+USERS_PER_PAGE = 20
 
 
 # ═════════════════════════════════════════════
@@ -673,12 +676,6 @@ async def is_admin_or_owner(chat_id, user_id):
 
 
 async def can_execute(chat_id, user_id, user_obj=None):
-    """
-    آیا کاربر مجاز به اجرای دستورات است؟
-    - ادمین‌های ارشد همیشه مجاز
-    - اگه کاربر توی followed_users هست، وضعیت پیروی چک می‌شه
-    - اگه ثبت نشده، چک می‌شه آیا ادمین تلگرامه. اگه بود، خودکار اضافه می‌شه (followed=1)
-    """
     if user_id in SUPER_ADMINS:
         return True
 
@@ -686,14 +683,12 @@ async def can_execute(chat_id, user_id, user_obj=None):
     if state is not None:
         return state == 1
 
-    # چک ادمین تلگرام
     if await is_telegram_admin(chat_id, user_id):
         name = user_display(user_obj) if user_obj else str(user_id)
         uname = getattr(user_obj, "username", None) if user_obj else None
         db.add_followed_user(user_id, chat_id, name, uname, is_followed=1)
         return True
 
-    # چک ادمین ثبت‌شده قدیمی
     if db.is_admin(user_id, chat_id):
         return True
 
@@ -1297,7 +1292,6 @@ async def group_handler(event):
         if event.sender_id == me.id:
             return
 
-        # ذخیره اطلاعات گروه
         try:
             db.save_group(chat.id, getattr(chat, "title", "—"), getattr(chat, "username", None))
         except Exception as ex:
@@ -1305,7 +1299,6 @@ async def group_handler(event):
 
         raw_text = (event.raw_text or "").strip()
 
-        # ═══ اول: بررسی درخواست واسطه ═══
         if is_mediator_group(event.chat_id, chat.id) and is_mediator_request(raw_text):
             try:
                 sender = await event.get_sender()
@@ -1315,7 +1308,6 @@ async def group_handler(event):
             await handle_mediator_request(event, chat, sender, replied_target=replied_target)
             return
 
-        # ═══ دوم: بررسی مجاز بودن برای اجرای دستور ═══
         try:
             sender = await event.get_sender()
         except Exception:
@@ -1335,7 +1327,6 @@ async def group_handler(event):
                     logger.debug(f"antispam error: {ex}")
             return
 
-        # ═══ از اینجا: کاربر مجاز ═══
         parsed = parse_command(raw_text)
         if not parsed:
             return
@@ -1495,22 +1486,33 @@ async def on_callback(event):
             await show_groups_list(event)
             await event.answer()
             return
+        if data.startswith("grp_pg:"):
+            parts = data.split(":")
+            gid = int(parts[1])
+            pg = int(parts[2])
+            await show_group_detail(event, gid, page=pg)
+            await event.answer()
+            return
         if data.startswith("grp:"):
             gid = int(data.split(":", 1)[1])
             await event.answer("⏳ در حال بارگذاری...", alert=False)
-            await show_group_detail(event, gid)
+            await show_group_detail(event, gid, page=0)
             return
         if data.startswith("flw_t:"):
             parts = data.split(":")
             uid = int(parts[1])
             gid = int(parts[2])
+            pg = int(parts[3]) if len(parts) > 3 else 0
             new_state = db.toggle_follow(uid, gid)
             if new_state is None:
                 await event.answer("⚠️ کاربر یافت نشد!", alert=True)
                 return
             status = "✅ پیروی می‌کنم" if new_state == 1 else "❌ پیروی نمی‌کنم"
             await event.answer(f"{status}", alert=False)
-            await show_group_detail(event, gid)
+            await show_group_detail(event, gid, page=pg)
+            return
+        if data == "noop":
+            await event.answer()
             return
 
         # ─── منوی اصلی ───
@@ -1620,14 +1622,13 @@ async def show_groups_list(event):
 
 
 # ═════════════════════════════════════════════
-# نمایش جزئیات گروه + سینک همه ادمین‌ها
+# نمایش جزئیات گروه با صفحه‌بندی
 # ═════════════════════════════════════════════
-async def show_group_detail(event, group_id):
+async def show_group_detail(event, group_id, page=0):
     group = db.get_bot_group(group_id)
     group_title = group.get("title") if group else "—"
     group_username = group.get("username") if group else None
 
-    # ═══ سینک همه ادمین‌های گروه از تلگرام ═══
     try:
         await sync_group_admins(group_id)
     except Exception as ex:
@@ -1635,8 +1636,26 @@ async def show_group_detail(event, group_id):
 
     users = db.get_followed_users(group_id)
 
+    super_set = set(SUPER_ADMINS)
+    users.sort(key=lambda u: (
+        0 if u["user_id"] in super_set else 1,
+        0 if u.get("is_followed") == 1 else 1,
+        (u.get("user_name") or "").lower(),
+    ))
+
+    total = len(users)
     followed_count = sum(1 for u in users if u.get("is_followed") == 1)
-    not_followed_count = len(users) - followed_count
+    not_followed_count = total - followed_count
+
+    total_pages = max(1, (total + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    if page < 0:
+        page = 0
+    if page >= total_pages:
+        page = total_pages - 1
+
+    start = page * USERS_PER_PAGE
+    end = start + USERS_PER_PAGE
+    page_users = users[start:end]
 
     title_txt = (
         f'<a href="https://t.me/{group_username}">{h(group_title)}</a>'
@@ -1653,16 +1672,22 @@ async def show_group_detail(event, group_id):
         "┗━━━━━━━━━━━━━━━━━━━━┛\n",
         f"\n{prem('eye', '👁')} <b>افرادی که ربات ازشون پیروی می‌کنه:</b>",
         f"┃ {prem('check', '✅')} فعال: <code>{followed_count}</code>\n"
-        f"┃ {prem('cross', '❌')} غیرفعال: <code>{not_followed_count}</code>\n",
+        f"┃ {prem('cross', '❌')} غیرفعال: <code>{not_followed_count}</code>\n"
+        f"┃ {prem('info', 'ℹ️')} مجموع: <code>{total}</code> نفر\n",
     ]
 
-    if not users:
+    if total == 0:
         lines.append(
             f"\n{prem('info', 'ℹ️')} <i>هیچ کسی هنوز ثبت نشده.</i>\n"
             f"اگه ربات دسترسی ادمین داره، ادمین‌های گروه خودکار اضافه می‌شن."
         )
     else:
-        for u in users[:15]:
+        lines.append(
+            f"\n{prem('list', '📋')} <b>صفحه {page + 1} از {total_pages}</b> "
+            f"(نمایش {start + 1} تا {min(end, total)})\n"
+        )
+
+        for idx, u in enumerate(page_users, start=start + 1):
             uid = u["user_id"]
             name = u.get("user_name") or "—"
             uname = u.get("username")
@@ -1672,9 +1697,9 @@ async def show_group_detail(event, group_id):
             if uname:
                 uname_line = f"\n┃ {prem('link', '🔗')} <a href=\"https://t.me/{uname}\">@{uname}</a>"
 
-            if uid in SUPER_ADMINS:
+            if uid in super_set:
                 lines.append(
-                    f"\n{prem('crown', '👑')} <b>[ادمین ارشد]</b> {h(name)}\n"
+                    f"\n{prem('crown', '👑')} <b>#{idx} [ادمین ارشد]</b> {h(name)}\n"
                     f"┃ {prem('id', '🆔')} <a href=\"tg://user?id={uid}\">{uid}</a>"
                     f"{uname_line}"
                 )
@@ -1682,35 +1707,50 @@ async def show_group_detail(event, group_id):
                 status_icon = prem('green', '🟢') if is_followed else prem('red', '🔴')
                 status_text = "پیروی می‌کنم" if is_followed else "پیروی نمی‌کنم"
                 lines.append(
-                    f"\n{status_icon} <b>{h(name)}</b>\n"
+                    f"\n{status_icon} <b>#{idx}</b> {h(name)}\n"
                     f"┃ {prem('id', '🆔')} <a href=\"tg://user?id={uid}\">{uid}</a>"
                     f"{uname_line}\n"
                     f"┃ 📍 وضعیت: {status_text}"
                 )
 
-        if len(users) > 15:
-            lines.append(f"\n{prem('info', 'ℹ️')} <i>و {len(users) - 15} نفر دیگر...</i>")
-
     text = "\n".join(lines)
 
-    # دکمه‌های toggle برای هر کاربر
+    # دکمه‌های toggle برای ادمین‌های این صفحه
     buttons = []
-    for u in users[:15]:
+    for u in page_users:
         uid = u["user_id"]
         name = (u.get("user_name") or "—")[:20]
         is_followed = u.get("is_followed") == 1
 
-        if uid in SUPER_ADMINS:
+        if uid in super_set:
             continue
 
-        if is_followed:
-            label = f"✅ {name}"
-        else:
-            label = f"❌ {name}"
+        icon = "✅" if is_followed else "❌"
+        label = f"{icon} {name}"
 
         buttons.append([
-            Button.inline(label, data=f"flw_t:{uid}:{group_id}".encode())
+            Button.inline(label, data=f"flw_t:{uid}:{group_id}:{page}".encode()),
         ])
+
+    # دکمه‌های صفحه‌بندی
+    nav_row = []
+    if total_pages > 1:
+        if page > 0:
+            nav_row.append(Button.inline(
+                "⬅️ قبلی",
+                data=f"grp_pg:{group_id}:{page - 1}".encode()
+            ))
+        nav_row.append(Button.inline(
+            f"📄 {page + 1}/{total_pages}",
+            data=b"noop"
+        ))
+        if page < total_pages - 1:
+            nav_row.append(Button.inline(
+                "بعدی ➡️",
+                data=f"grp_pg:{group_id}:{page + 1}".encode()
+            ))
+    if nav_row:
+        buttons.append(nav_row)
 
     buttons.append([Button.inline("🔙 بازگشت به گروه‌ها", data=b"grp_list")])
     buttons.append([Button.inline("🏠 منوی اصلی", data=b"back")])
