@@ -4,7 +4,7 @@
 ║         🤖  ربات مدیریت حرفه‌ای گروه‌های تلگرام  🤖           ║
 ║                    Group Manager Bot                         ║
 ║         Telethon + PostgreSQL + Flask + asyncio              ║
-║   ✨ ایموجی پرمیوم + اخطار + واسطه + تایید/رد + محتوای پیام ✨║
+║  ✨ ایموجی پرمیوم + ویرایش گروهی واسطه + تایید/رد حرفه‌ای ✨ ║
 ║           🚀 آماده استقرار روی Render (Web Service)          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -71,6 +71,12 @@ MEDIATOR_USERNAMES = ["@mAMmA2222", "@mamad_slayer"]
 MEDIATOR_COOLDOWN_SECONDS = 30
 
 _MEDIATOR_COOLDOWN = {}
+
+# حافظه درخواست‌های واسطه برای ویرایش گروهی
+# { request_id: {'messages': [(admin_id, msg_id), ...], 'requester': uid,
+#                'target': uid, 'status': 'pending'/'approved'/'rejected',
+#                'admin_name': str, 'chat_title': str, 'chat_id': int} }
+_MEDIATOR_REQUESTS = {}
 
 
 # ═════════════════════════════════════════════
@@ -375,10 +381,24 @@ PREMIUM_EMOJI = {
     "clock": "5458603043203327669",
     "handshake": "5447410659077661506",
     "message": "5443038326535759644",
+    "alert": "5447644880824181073",
+    "hourglass": "5224736245665511429",
+    "green": "5206607081334906820",
+    "red": "5210952531676504517",
+    "target": "5397782960512444700",
+    "tag": "5436113877181941026",
+    "diamond": "5424972470023104089",
+    "announce": "5231200819986047254",
+    "sparkles": "6337048821603763745",
+    "wave": "5447410659077661506",
+    "rocket": "5424972470023104089",
+    "thumbs_up": "5337080053119336309",
+    "thumbs_down": "5210952531676504517",
 }
 
 
 def prem(key: str, fallback: str) -> str:
+    """تبدیل یک ایموجی معمولی به ایموجی پرمیوم"""
     emoji_id = PREMIUM_EMOJI.get(key)
     if emoji_id:
         return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
@@ -508,7 +528,6 @@ def format_report(action_title, action_emoji_key, target, admin_user, chat,
     reason_txt = h(reason) if reason else "—"
     link_txt = f'<a href="{link}">اینجا کلیک کنید</a>' if link else "—"
 
-    # بخش پیام کاربر (در صورت وجود)
     msg_section = ""
     if target_message:
         preview = target_message.strip()
@@ -526,18 +545,18 @@ def format_report(action_title, action_emoji_key, target, admin_user, chat,
         "╚══════════════════════════════════╝\n\n"
         f"◆ {prem('fire', '🔥')} <b>نوع:</b> {action_title}\n"
         f"◆ {prem('time', '⏱')} <b>زمان:</b> <code>{now_iran_str()}</code>\n\n"
-        "┏━━━ 👤 <b>کاربر هدف</b> ━━━┓\n"
-        f"┃ 🏷️ <b>نام:</b> {h(target_name)}\n"
+        "┏━━━ " + prem('user', '👤') + " <b>کاربر هدف</b> ━━━┓\n"
+        f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(target_name)}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> {target_id_link}\n"
         f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {target_username_txt}\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
-        "┏━━━ 🛡 <b>توسط ادمین</b> ━━━┓\n"
-        f"┃ 🏷️ <b>نام:</b> {h(admin_name)}\n"
+        "┏━━━ " + prem('admin', '🛡') + " <b>توسط ادمین</b> ━━━┓\n"
+        f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(admin_name)}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> {admin_id_link}\n"
         f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {admin_username_txt}\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
-        "┏━━━ 📌 <b>گروه</b> ━━━┓\n"
-        f"┃ 🏷️ <b>نام:</b> {chat_title_txt}\n"
+        "┏━━━ " + prem('group', '📌') + " <b>گروه</b> ━━━┓\n"
+        f"┃ {prem('tag', '🏷️')} <b>نام:</b> {chat_title_txt}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{chat.id}</code>\n"
         f"┃ {prem('reason', '💬')} <b>دلیل:</b> {reason_txt}\n"
         f"┃ {prem('link', '🔗')} <b>پیام:</b> {link_txt}\n"
@@ -580,7 +599,6 @@ async def get_reply_target(event):
 
 
 async def get_replied_message_text(event):
-    """گرفتن متن پیام ریپلای‌شده (اگه وجود داشته باشه)"""
     if not event.is_reply:
         return None
     try:
@@ -617,7 +635,6 @@ def is_mediator_group(chat_id, raw_chat_id=None):
 
 
 def is_mediator_request(raw_text):
-    """فقط اگه متن دقیقاً 'واسطه' بود (تک کلمه)"""
     return (raw_text or "").strip() == MEDIATOR_KEYWORD
 
 
@@ -625,7 +642,6 @@ def is_mediator_request(raw_text):
 # ۷) ارسال گزارش
 # ═════════════════════════════════════════════
 async def send_report(text, buttons=None):
-    """ارسال گزارش به همه ادمین‌های ارشد + کانال لاگ"""
     for admin_id in SUPER_ADMINS:
         try:
             await client.send_message(
@@ -648,12 +664,6 @@ async def send_report(text, buttons=None):
 # ۸) سیستم واسطه خودکار
 # ═════════════════════════════════════════════
 async def handle_mediator_request(event, chat, sender, replied_target=None):
-    """
-    اگه replied_target داده شده:
-        → آیدی فرستنده + آیدی طرف مقابل
-    وگرنه:
-        → فقط آیدی فرستنده
-    """
     now_ts = datetime.now(timezone.utc).timestamp()
     uid = sender.id if sender else event.sender_id
 
@@ -662,7 +672,7 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
         remaining = int(MEDIATOR_COOLDOWN_SECONDS - (now_ts - last_ts))
         try:
             await event.reply(
-                f"{prem('warning', '⏳')} <b>لطفاً {remaining} ثانیه دیگر دوباره تلاش کنید.</b>",
+                f"{prem('hourglass', '⏳')} <b>لطفاً {remaining} ثانیه دیگر دوباره تلاش کنید.</b>",
                 parse_mode="html",
             )
         except Exception:
@@ -670,7 +680,6 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
         return
     _MEDIATOR_COOLDOWN[uid] = now_ts
 
-    # ── اطلاعات درخواست‌دهنده ──
     sender_name = user_display(sender) if sender else "ناشناس"
     sender_username = getattr(sender, "username", None) if sender else None
     sender_id_link = f'<a href="tg://user?id={uid}">{uid}</a>'
@@ -679,7 +688,6 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
         if sender_username else "—"
     )
 
-    # ── اطلاعات طرف مقابل (اگه ریپلای شده) ──
     target_section_group = ""
     target_section_admin = ""
     if replied_target is not None:
@@ -691,38 +699,36 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
             if tgt_username else "—"
         )
         target_section_group = (
-            "\n┏━━━ 🎯 <b>طرف مقابل</b> ━━━┓\n"
-            f"┃ 🏷️ <b>نام:</b> {h(tgt_name)}\n"
+            "\n┏━━━ " + prem('target', '🎯') + " <b>طرف مقابل</b> ━━━┓\n"
+            f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(tgt_name)}\n"
             f"┃ {prem('id', '🆔')} <b>آیدی:</b> {tgt_id_link}\n"
             f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {tgt_username_link}\n"
             "┗━━━━━━━━━━━━━━━━━━━━┛\n"
         )
         target_section_admin = target_section_group
 
-    # ── پیام گروه ──
     group_reply = (
         "╔══════════════════════════════════╗\n"
         f"   {prem('handshake', '🤝')} <b>درخواست واسطه ثبت شد</b> {prem('handshake', '🤝')}\n"
         "╚══════════════════════════════════╝\n\n"
-        "┏━━━ 👤 <b>درخواست‌دهنده</b> ━━━┓\n"
-        f"┃ 🏷️ <b>نام:</b> {h(sender_name)}\n"
+        "┏━━━ " + prem('user', '👤') + " <b>درخواست‌دهنده</b> ━━━┓\n"
+        f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(sender_name)}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> {sender_id_link}\n"
         f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {sender_username_link}\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛"
         f"{target_section_group}"
         "\n"
         f"{prem('star', '⭐')} <b>واسطه‌های رسمی:</b>\n"
-        f"┃ 👤 {MEDIATOR_USERNAMES[0]}\n"
-        f"┃ 👤 {MEDIATOR_USERNAMES[1]}\n\n"
+        f"┃ {prem('user', '👤')} {MEDIATOR_USERNAMES[0]}\n"
+        f"┃ {prem('user', '👤')} {MEDIATOR_USERNAMES[1]}\n\n"
         f"{prem('clock', '⏱')} <b>لطفاً صبر کنید...</b>\n"
-        "به‌زودی یکی از واسطه‌ها با شما تماس می‌گیرد. ✅"
+        f"به‌زودی یکی از واسطه‌ها با شما تماس می‌گیرد. {prem('check', '✅')}"
     )
     try:
         await event.reply(group_reply, parse_mode="html")
     except Exception as ex:
         logger.error(f"خطا در ارسال پیام واسطه در گروه: {ex}")
 
-    # ── گزارش به ادمین‌ها با دکمه ──
     chat_title = getattr(chat, "title", "—") or "—"
     chat_username = getattr(chat, "username", None)
     chat_title_txt = (
@@ -733,18 +739,18 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
 
     admin_msg = (
         "╔══════════════════════════════════╗\n"
-        f"   {prem('warning', '🚨')} <b>درخواست واسطه جدید</b> {prem('warning', '🚨')}\n"
+        f"   {prem('alert', '🚨')} <b>درخواست واسطه جدید</b> {prem('alert', '🚨')}\n"
         "╚══════════════════════════════════╝\n\n"
         f"◆ {prem('fire', '🔥')} <b>نوع:</b> درخواست واسطه\n"
         f"◆ {prem('time', '⏱')} <b>زمان:</b> <code>{now_iran_str()}</code>\n\n"
-        "┏━━━ 👤 <b>درخواست‌دهنده</b> ━━━┓\n"
-        f"┃ 🏷️ <b>نام:</b> {h(sender_name)}\n"
+        "┏━━━ " + prem('user', '👤') + " <b>درخواست‌دهنده</b> ━━━┓\n"
+        f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(sender_name)}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> {sender_id_link}\n"
         f"┃ {prem('link', '🔗')} <b>یوزرنیم:</b> {sender_username_link}\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛"
         f"{target_section_admin}"
-        "\n┏━━━ 📌 <b>گروه</b> ━━━┓\n"
-        f"┃ 🏷️ <b>نام:</b> {chat_title_txt}\n"
+        "\n┏━━━ " + prem('group', '📌') + " <b>گروه</b> ━━━┓\n"
+        f"┃ {prem('tag', '🏷️')} <b>نام:</b> {chat_title_txt}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{chat.id}</code>\n"
         f"┃ {prem('link', '🔗')} <b>لینک پیام:</b> "
         f"{f'<a href=\"{link}\">اینجا کلیک کنید</a>' if link else '—'}\n"
@@ -753,28 +759,51 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
     )
 
     target_uid = replied_target.id if replied_target else 0
+
+    # شناسه یکتای درخواست
+    request_id = f"{uid}_{int(now_ts)}"
+
     buttons = [[
-        Button.inline("✅ تایید", data=f"med_a:{uid}:{target_uid}".encode()),
-        Button.inline("❌ رد", data=f"med_r:{uid}:{target_uid}".encode()),
+        Button.inline("✅ تایید", data=f"med_a:{request_id}".encode()),
+        Button.inline("❌ رد", data=f"med_r:{request_id}".encode()),
     ]]
 
+    # ارسال به همه ادمین‌ها و ذخیره msg_id
+    sent_messages = []
     for admin_id in SUPER_ADMINS:
         try:
-            await client.send_message(
+            msg = await client.send_message(
                 admin_id, admin_msg, parse_mode="html",
                 link_preview=False, buttons=buttons,
             )
+            sent_messages.append((admin_id, msg.id))
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش واسطه به {admin_id}: {ex}")
 
     if LOG_CHANNEL_ID:
         try:
-            await client.send_message(
+            msg = await client.send_message(
                 LOG_CHANNEL_ID, admin_msg, parse_mode="html",
                 link_preview=False, buttons=buttons,
             )
+            sent_messages.append((LOG_CHANNEL_ID, msg.id))
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش واسطه به کانال: {ex}")
+
+    # ذخیره در حافظه برای ویرایش گروهی
+    _MEDIATOR_REQUESTS[request_id] = {
+        "messages": sent_messages,
+        "requester": uid,
+        "requester_name": sender_name,
+        "target": target_uid,
+        "target_name": user_display(replied_target) if replied_target else None,
+        "status": "pending",
+        "admin_name": None,
+        "admin_id": None,
+        "chat_title": chat_title,
+        "chat_id": chat.id,
+        "timestamp": now_iran_str(),
+    }
 
     db.add_log("mediator-request", uid, 0, chat.id, "درخواست واسطه")
 
@@ -815,7 +844,7 @@ async def check_antispam(event, chat, sender):
             )
             await client(EditBannedRequest(chat.id, sender.id, rights))
             await event.reply(
-                f"{prem('warning', '🚨')} <b>کاربر {h(user_display(sender))} به دلیل ارسال پیام‌های پیاپی، "
+                f"{prem('alert', '🚨')} <b>کاربر {h(user_display(sender))} به دلیل ارسال پیام‌های پیاپی، "
                 f"به مدت ۵ دقیقه میوت شد.</b>",
                 parse_mode="html",
             )
@@ -1053,7 +1082,7 @@ async def do_warn(event, chat, target, reason, admin_user, target_msg=None):
             "┏━━━ " + prem('warning', '⚠️') + " <b>اخطار جدید</b> ━━━┓\n"
             f"┃ {prem('user', '👤')} <b>کاربر:</b> {h(user_display(target))}\n"
             f"┃ 📊 <b>اخطارها:</b> <code>{new_count}/{max_warns}</code>\n"
-            f"┃ ⏳ <b>تا بن خودکار:</b> <code>{remaining}</code> اخطار دیگر"
+            f"┃ {prem('hourglass', '⏳')} <b>تا بن خودکار:</b> <code>{remaining}</code> اخطار دیگر"
             f"{reason_txt}\n"
             "┗━━━━━━━━━━━━━━━━━━━━┛",
             parse_mode="html",
@@ -1106,13 +1135,12 @@ async def group_handler(event):
 
         raw_text = (event.raw_text or "").strip()
 
-        # ═══ اول: بررسی درخواست واسطه (فقط تک کلمه «واسطه») ═══
+        # ═══ اول: بررسی درخواست واسطه ═══
         if is_mediator_group(event.chat_id, chat.id) and is_mediator_request(raw_text):
             try:
                 sender = await event.get_sender()
             except Exception:
                 sender = None
-            # اگه روی کسی ریپلای زده باشه، طرف مقابل رو هم بگیر
             replied_target = await get_reply_target(event)
             await handle_mediator_request(event, chat, sender, replied_target=replied_target)
             return
@@ -1163,11 +1191,8 @@ async def group_handler(event):
             return
 
         admin_user = sender if sender is not None else await event.get_sender()
-
-        # محتوای پیام کاربر هدف (برای گزارش)
         target_msg = await get_replied_message_text(event)
 
-        # ─── بن ───
         if cmd == "ban":
             if not rest:
                 await event.reply(
@@ -1184,7 +1209,6 @@ async def group_handler(event):
         elif cmd == "unban":
             await do_unban(event, chat, target, rest, admin_user)
 
-        # ─── سکوت ───
         elif cmd == "mute":
             seconds, reason = parse_duration(rest)
             if not reason:
@@ -1204,7 +1228,6 @@ async def group_handler(event):
         elif cmd == "unmute":
             await do_unmute(event, chat, target, rest, admin_user)
 
-        # ─── اخطار ───
         elif cmd == "warn":
             if not rest:
                 await event.reply(
@@ -1245,8 +1268,8 @@ MAIN_MENU_TEXT = (
     f"┃ {prem('unmute', '🔊')} آن‌میوت کردن کاربر\n"
     f"┃ {prem('warning', '⚠️')} اخطار و بن خودکار\n"
     f"┃ {prem('shield', '🛡')} مدیریت ادمین‌ها\n"
-    f"┃ 🤝 درخواست واسطه با تایید/رد\n"
-    f"┃ 🚨 ضد اسپم و ضد لینک\n\n"
+    f"┃ {prem('handshake', '🤝')} درخواست واسطه با تایید/رد\n"
+    f"┃ {prem('alert', '🚨')} ضد اسپم و ضد لینک\n\n"
     "از دکمه‌های زیر استفاده کنید:"
 )
 
@@ -1348,81 +1371,134 @@ async def on_callback(event):
 
 
 async def handle_mediator_callback(event, data):
-    """پردازش دکمه‌های تایید/رد واسطه"""
+    """پردازش دکمه‌های تایید/رد واسطه + ویرایش گروهی همه پیام‌ها"""
     try:
-        # data شبیه: med_a:123:456 یا med_r:123:0
-        parts = data.split(":")
-        action = parts[0]  # med_a یا med_r
-        requester_id = int(parts[1])
-        target_id = int(parts[2]) if len(parts) > 2 else 0
+        # data شبیه: med_a:123456_1700000000 یا med_r:...
+        action, request_id = data.split(":", 1)
+
+        req = _MEDIATOR_REQUESTS.get(request_id)
+        if not req:
+            await event.answer("⚠️ این درخواست منقضی شده است!", alert=True)
+            return
+
+        if req["status"] != "pending":
+            await event.answer(
+                f"⚠️ این درخواست قبلاً توسط {req.get('admin_name', 'ادمین')} پردازش شده!",
+                alert=True,
+            )
+            return
 
         admin_user = await event.get_sender()
         admin_name = user_display(admin_user)
 
         is_approve = action == "med_a"
+        req["status"] = "approved" if is_approve else "rejected"
+        req["admin_name"] = admin_name
+        req["admin_id"] = admin_user.id
 
-        if is_approve:
-            status_emoji = "✅"
-            status_text = "تایید شد"
-            status_color = "🟢"
-        else:
-            status_emoji = "❌"
-            status_text = "رد شد"
-            status_color = "🔴"
-
-        # متن پیام‌های اطلاع‌رسانی
+        # ─── اطلاعات ───
+        requester_id = req["requester"]
+        target_id = req["target"]
         requester_link = f'<a href="tg://user?id={requester_id}">{requester_id}</a>'
+        admin_id_link = f'<a href="tg://user?id={admin_user.id}">{admin_user.id}</a>'
+
         target_line = ""
         if target_id:
             target_link = f'<a href="tg://user?id={target_id}">{target_id}</a>'
-            target_line = f"\n┃ 🎯 <b>طرف مقابل:</b> {target_link}"
-
-        # به درخواست‌دهنده پیام بده
-        try:
-            await client.send_message(
-                requester_id,
-                f"{status_color} <b>درخواست واسطه شما {status_text}</b>\n\n"
-                f"👤 <b>توسط ادمین:</b> {h(admin_name)}\n"
-                f"⏱ <b>زمان:</b> {now_iran_str()}",
-                parse_mode="html",
+            target_line = (
+                "\n┏━━━ " + prem('target', '🎯') + " <b>طرف مقابل</b> ━━━┓\n"
+                f"┃ {prem('id', '🆔')} <b>آیدی:</b> {target_link}\n"
+                "┗━━━━━━━━━━━━━━━━━━━━┛\n"
             )
+
+        if is_approve:
+            status_line = f"{prem('green', '🟢')} <b>وضعیت:</b> تایید شد"
+            header_emoji = prem('check', '✅')
+            header_text = "واسطه تایید شد"
+        else:
+            status_line = f"{prem('red', '🔴')} <b>وضعیت:</b> رد شد"
+            header_emoji = prem('cross', '❌')
+            header_text = "واسطه رد شد"
+
+        result_msg = (
+            "╔══════════════════════════════════╗\n"
+            f"   {header_emoji} <b>{header_text}</b> {header_emoji}\n"
+            "╚══════════════════════════════════╝\n\n"
+            f"◆ {status_line}\n"
+            f"◆ {prem('time', '⏱')} <b>زمان:</b> <code>{now_iran_str()}</code>\n\n"
+            "┏━━━ " + prem('admin', '🛡') + " <b>ادمین پردازش‌کننده</b> ━━━┓\n"
+            f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(admin_name)}\n"
+            f"┃ {prem('id', '🆔')} <b>آیدی:</b> {admin_id_link}\n"
+            "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+            "┏━━━ " + prem('user', '👤') + " <b>درخواست‌دهنده</b> ━━━┓\n"
+            f"┃ {prem('id', '🆔')} <b>آیدی:</b> {requester_link}\n"
+            "┗━━━━━━━━━━━━━━━━━━━━┛"
+            f"{target_line}"
+            "\n"
+            f"{prem('sparkles', '✨')} <i>این درخواست توسط ادمین {h(admin_name)} "
+            f"{'پذیرفته' if is_approve else 'رد'} شد.</i>\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🤖 <i>Group Manager Bot</i>"
+        )
+
+        # ─── ویرایش گروهی همه پیام‌های ارسال‌شده ───
+        for admin_id, msg_id in req["messages"]:
+            try:
+                await client.edit_message(
+                    admin_id, msg_id, result_msg,
+                    parse_mode="html", buttons=None,
+                )
+            except MessageNotModifiedError:
+                pass
+            except Exception as ex:
+                logger.debug(f"ویرایش پیام واسطه برای {admin_id} ناموفق: {ex}")
+
+        # ─── اطلاع به درخواست‌دهنده ───
+        try:
+            if is_approve:
+                req_msg = (
+                    f"{prem('check', '✅')} <b>درخواست واسطه شما تایید شد!</b>\n\n"
+                    f"┏━━━ " + prem('admin', '🛡') + " <b>ادمین</b> ━━━┓\n"
+                    f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(admin_name)}\n"
+                    f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{admin_user.id}</code>\n"
+                    "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+                    f"{prem('clock', '⏱')} <b>زمان:</b> <code>{now_iran_str()}</code>\n\n"
+                    f"{prem('handshake', '🤝')} <b>به‌زودی واسطه با شما تماس می‌گیرد.</b>"
+                )
+            else:
+                req_msg = (
+                    f"{prem('cross', '❌')} <b>درخواست واسطه شما رد شد.</b>\n\n"
+                    f"┏━━━ " + prem('admin', '🛡') + " <b>ادمین</b> ━━━┓\n"
+                    f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(admin_name)}\n"
+                    f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{admin_user.id}</code>\n"
+                    "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+                    f"{prem('clock', '⏱')} <b>زمان:</b> <code>{now_iran_str()}</code>"
+                )
+            await client.send_message(requester_id, req_msg, parse_mode="html")
         except Exception as ex:
             logger.debug(f"ارسال به درخواست‌دهنده ناموفق: {ex}")
 
-        # به طرف مقابل هم پیام بده (اگه وجود داره)
+        # ─── اطلاع به طرف مقابل ───
         if target_id:
             try:
-                await client.send_message(
-                    target_id,
-                    f"{status_color} <b>وضعیت درخواست واسطه</b>\n\n"
-                    f"✅ <b>وضعیت:</b> {status_text}\n"
-                    f"👤 <b>توسط ادمین:</b> {h(admin_name)}\n"
-                    f"⏱ <b>زمان:</b> {now_iran_str()}",
-                    parse_mode="html",
-                )
+                if is_approve:
+                    tgt_msg = (
+                        f"{prem('check', '✅')} <b>درخواست واسطه تایید شد!</b>\n\n"
+                        f"┏━━━ " + prem('admin', '🛡') + " <b>ادمین</b> ━━━┓\n"
+                        f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(admin_name)}\n"
+                        "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+                        f"{prem('handshake', '🤝')} <b>به‌زودی واسطه با شما تماس می‌گیرد.</b>"
+                    )
+                else:
+                    tgt_msg = (
+                        f"{prem('cross', '❌')} <b>درخواست واسطه رد شد.</b>\n\n"
+                        f"┏━━━ " + prem('admin', '🛡') + " <b>ادمین</b> ━━━┓\n"
+                        f"┃ {prem('tag', '🏷️')} <b>نام:</b> {h(admin_name)}\n"
+                        "┗━━━━━━━━━━━━━━━━━━━━┛"
+                    )
+                await client.send_message(target_id, tgt_msg, parse_mode="html")
             except Exception as ex:
                 logger.debug(f"ارسال به طرف مقابل ناموفق: {ex}")
-
-        # به همه ادمین‌ها اطلاع بده (روی همون پیام ویرایش کن یا پیام جدید)
-        result_msg = (
-            "╔══════════════════════════════════╗\n"
-            f"   {status_emoji} <b>واسطه {status_text}</b> {status_emoji}\n"
-            "╚══════════════════════════════════╝\n\n"
-            f"👤 <b>توسط ادمین:</b> {h(admin_name)}\n"
-            f"🆔 <b>آیدی ادمین:</b> <code>{admin_user.id}</code>\n\n"
-            f"┏━━━ 🎯 <b>درخواست‌دهنده</b> ━━━┓\n"
-            f"┃ {prem('id', '🆔')} <b>آیدی:</b> {requester_link}"
-            f"{target_line}\n"
-            "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
-            f"⏱ <b>زمان:</b> {now_iran_str()}"
-        )
-
-        try:
-            await event.edit(result_msg, parse_mode="html", buttons=None)
-        except MessageNotModifiedError:
-            pass
-        except Exception as ex:
-            logger.warning(f"ویرایش پیام واسطه ناموفق: {ex}")
 
         db.add_log(
             "mediator-approve" if is_approve else "mediator-reject",
@@ -1430,7 +1506,10 @@ async def handle_mediator_callback(event, data):
             f"target={target_id}",
         )
 
-        await event.answer(f"{status_emoji} درخواست واسطه {status_text}")
+        await event.answer(
+            f"{'✅ تایید شد' if is_approve else '❌ رد شد'} - همه ادمین‌ها مطلع شدند",
+            alert=False,
+        )
 
     except Exception as ex:
         logger.exception(f"خطا در handle_mediator_callback: {ex}")
@@ -1447,13 +1526,13 @@ async def cb_stats(event):
         "╔══════════════════════════════════╗\n"
         f"   {prem('stats', '📊')} <b>آمار کلی ربات</b> {prem('stats', '📊')}\n"
         "╚══════════════════════════════════╝\n\n"
-        f"┏━━━ {prem('fire', '🔥')} <b>وضعیت ربات</b> ━━━┓\n"
+        "┏━━━ " + prem('fire', '🔥') + " <b>وضعیت ربات</b> ━━━┓\n"
         f"┃ {prem('ban', '🚫')} <b>بن‌های فعال:</b> <code>{db.count_bans()}</code>\n"
         f"┃ {prem('mute', '🔇')} <b>میوت‌های فعال:</b> <code>{db.count_mutes()}</code>\n"
         f"┃ {prem('warning', '⚠️')} <b>کل اخطارها:</b> <code>{db.count_warnings()}</code>\n"
         f"┃ {prem('admin', '🛡')} <b>ادمین‌های ثبت‌شده:</b> <code>{db.count_admins()}</code>\n"
         f"┃ 📝 <b>تعداد کل لاگ‌ها:</b> <code>{db.count_logs()}</code>\n"
-        f"┃ 🎯 <b>سقف اخطار:</b> <code>{max_warns}</code>\n"
+        f"┃ {prem('target', '🎯')} <b>سقف اخطار:</b> <code>{max_warns}</code>\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
         f"{prem('time', '⏱')} <b>آخرین بروزرسانی:</b>\n<code>{now_iran_str()}</code>"
     )
@@ -1534,7 +1613,7 @@ async def cb_warns(event):
             "╔══════════════════════════════════╗",
             f"   {prem('warning', '⚠️')} <b>لیست اخطارها</b> ({len(rows)})",
             "╚══════════════════════════════════╝\n",
-            f"🎯 <b>سقف اخطار:</b> <code>{max_warns}</code>\n",
+            f"{prem('target', '🎯')} <b>سقف اخطار:</b> <code>{max_warns}</code>\n",
         ]
         for i, r in enumerate(rows, 1):
             user_link = f'<a href="tg://user?id={r["user_id"]}">{r["user_id"]}</a>'
@@ -1585,17 +1664,17 @@ async def cb_help(event):
         f"   {prem('info', '📖')} <b>راهنمای دستورات</b> {prem('info', '📖')}\n"
         "╚══════════════════════════════════╝\n\n"
         "برای اجرای دستور، روی پیام کاربر هدف <b>ریپلای</b> بزنید:\n\n"
-        f"┏━━━ {prem('ban', '🚫')} <b>بن کردن</b> ━━━┓\n"
+        "┏━━━ " + prem('ban', '🚫') + " <b>بن کردن</b> ━━━┓\n"
         "┃ <code>بن [دلیل]</code>\n"
         "┃ <code>سیک [دلیل]</code>\n"
         "┃ <code>صیک [دلیل]</code>\n"
         "┃ 🔹 مثال: <code>بن تبلیغات</code>\n"
         "┃ ⚠️ بدون دلیل اجرا نمی‌شود\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
-        f"┏━━━ {prem('unban', '✅')} <b>آنبن کردن</b> ━━━┓\n"
+        "┏━━━ " + prem('unban', '✅') + " <b>آنبن کردن</b> ━━━┓\n"
         "┃ <code>آنبن</code> | <code>unban</code>\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
-        f"┏━━━ {prem('mute', '🔇')} <b>سکوت (میوت)</b> ━━━┓\n"
+        "┏━━━ " + prem('mute', '🔇') + " <b>سکوت (میوت)</b> ━━━┓\n"
         "┃ <code>سکوت [زمان] [دلیل]</code>\n"
         "┃ 🔹 مثال‌ها:\n"
         "┃   <code>سکوت 20 اسپم</code> → ۲۰ دقیقه\n"
@@ -1605,18 +1684,18 @@ async def cb_help(event):
         "┃   <code>سکوت 1d بی‌احترامی</code> → ۱ روز\n"
         "┃ ⚠️ بدون دلیل اجرا نمی‌شود\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
-        f"┏━━━ {prem('unmute', '🔊')} <b>آن‌میوت</b> ━━━┓\n"
+        "┏━━━ " + prem('unmute', '🔊') + " <b>آن‌میوت</b> ━━━┓\n"
         "┃ <code>آن‌میوت</code> | <code>unmute</code>\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
-        f"┏━━━ {prem('warning', '⚠️')} <b>اخطار</b> ━━━┓\n"
+        "┏━━━ " + prem('warning', '⚠️') + " <b>اخطار</b> ━━━┓\n"
         "┃ <code>اخطار [دلیل]</code>\n"
         "┃ 🔹 پس از <b>۳ اخطار</b> → بن خودکار\n"
         "┃ ⚠️ بدون دلیل اجرا نمی‌شود\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
-        f"┏━━━ {prem('check', '✔️')} <b>حذف اخطار</b> ━━━┓\n"
+        "┏━━━ " + prem('check', '✔️') + " <b>حذف اخطار</b> ━━━┓\n"
         "┃ <code>حذف اخطار</code>\n"
         "┗━━━━━━━━━━━━━━━┛\n\n"
-        f"┏━━━ {prem('handshake', '🤝')} <b>واسطه</b> ━━━┓\n"
+        "┏━━━ " + prem('handshake', '🤝') + " <b>واسطه</b> ━━━┓\n"
         f"┃ در گپ <code>{MEDIATOR_CHAT_ID}</code> بنویسید:\n"
         "┃ <code>واسطه</code> (دقیقاً فقط همین کلمه)\n"
         "┃ 🔹 اگه روی پیام کسی ریپلای بزنید، آیدی هر دو ثبت می‌شه\n"
@@ -1634,8 +1713,8 @@ async def cb_settings(event):
         f"   {prem('settings', '⚙️')} <b>تنظیمات ربات</b> {prem('settings', '⚙️')}\n"
         "╚══════════════════════════════════╝\n\n"
         f"{prem('fire', '🔥')} <b>قابلیت‌های حفاظتی:</b>\n\n"
-        f"┃ 🚨 ضد اسپم: {'✅ روشن' if anti_spam else '❌ خاموش'}\n"
-        f"┃ 🔗 ضد لینک: {'✅ روشن' if anti_link else '❌ خاموش'}\n"
+        f"┃ {prem('alert', '🚨')} ضد اسپم: {'✅ روشن' if anti_spam else '❌ خاموش'}\n"
+        f"┃ {prem('link', '🔗')} ضد لینک: {'✅ روشن' if anti_link else '❌ خاموش'}\n"
         f"┃ {prem('warning', '⚠️')} سقف اخطار: <code>{max_warns}</code>\n\n"
         "برای تغییر، روی دکمه‌ها کلیک کنید:"
     )
@@ -1755,6 +1834,12 @@ async def _periodic_cleanup():
     while True:
         try:
             db.cleanup_expired_mutes()
+            # پاکسازی درخواست‌های قدیمی واسطه (بیشتر از ۱۰۰ تا)
+            if len(_MEDIATOR_REQUESTS) > 100:
+                # حذف ۵۰ تای قدیمی‌تر
+                sorted_keys = sorted(_MEDIATOR_REQUESTS.keys())
+                for k in sorted_keys[:50]:
+                    _MEDIATOR_REQUESTS.pop(k, None)
         except Exception as ex:
             logger.warning(f"cleanup error: {ex}")
         await asyncio.sleep(60)
@@ -1782,7 +1867,7 @@ async def main():
                 "╔══════════════════════════════════╗\n"
                 f"   {prem('check', '✅')} <b>ربات با موفقیت روشن شد</b>\n"
                 "╚══════════════════════════════════╝\n\n"
-                f"┏━━━ {prem('fire', '🔥')} <b>اطلاعات ربات</b> ━━━┓\n"
+                "┏━━━ " + prem('fire', '🔥') + " <b>اطلاعات ربات</b> ━━━┓\n"
                 f"┃ 🤖 <b>یوزرنیم:</b> @{me.username}\n"
                 f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{me.id}</code>\n"
                 f"┃ {prem('time', '⏱')} <b>زمان:</b> {now_iran_str()}\n"
