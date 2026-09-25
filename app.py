@@ -23,11 +23,16 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from flask import Flask
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.channels import EditBannedRequest, GetParticipantRequest
+from telethon.tl.functions.channels import (
+    EditBannedRequest,
+    GetParticipantRequest,
+    GetParticipantsRequest,
+)
 from telethon.tl.types import (
     ChatBannedRights,
     ChannelParticipantCreator,
     ChannelParticipantAdmin,
+    ChannelParticipantsAdmins,
     User,
 )
 from telethon.errors import (
@@ -177,7 +182,6 @@ class Database:
                     value TEXT
                 );
             """)
-            # جدول گروه‌های ربات
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS bot_groups (
                     group_id  BIGINT PRIMARY KEY,
@@ -187,7 +191,6 @@ class Database:
                     last_seen TEXT
                 );
             """)
-            # جدول افرادی که ربات ازشون پیروی می‌کنه
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS followed_users (
                     user_id     BIGINT NOT NULL,
@@ -416,7 +419,6 @@ class Database:
             return [dict(r) for r in cur.fetchall()]
 
     def get_follow_state(self, user_id, group_id):
-        """خروجی: None (ثبت نشده) | 0 (پیروی نمی‌کنم) | 1 (پیروی می‌کنم)"""
         with self._cursor() as cur:
             cur.execute(
                 "SELECT is_followed FROM followed_users WHERE user_id=%s AND group_id=%s",
@@ -426,7 +428,6 @@ class Database:
             return row["is_followed"] if row else None
 
     def toggle_follow(self, user_id, group_id):
-        """تغییر وضعیت پیروی. خروجی: وضعیت جدید (0/1)"""
         with self._cursor() as cur:
             cur.execute(
                 "SELECT is_followed FROM followed_users WHERE user_id=%s AND group_id=%s",
@@ -664,7 +665,6 @@ async def is_telegram_admin(chat_id, user_id):
 
 
 async def is_admin_or_owner(chat_id, user_id):
-    """چک اینکه کاربر ادمین هست یا نه (برای محافظت از ادمین‌ها به عنوان هدف)"""
     if user_id in SUPER_ADMINS:
         return True
     if db.is_admin(user_id, chat_id):
@@ -1232,7 +1232,58 @@ async def do_unwarn(event, chat, target, reason, admin_user):
 
 
 # ═════════════════════════════════════════════
-# ۱۱) هندلر اصلی گروه
+# ۱۱) سینک ادمین‌های گروه از تلگرام
+# ═════════════════════════════════════════════
+async def sync_group_admins(group_id):
+    """همه ادمین‌های گروه رو از تلگرام می‌گیره و توی دیتابیس ثبت می‌کنه"""
+    try:
+        result = await client(GetParticipantsRequest(
+            channel=group_id,
+            filter=ChannelParticipantsAdmins(),
+            offset=0,
+            limit=200,
+            hash=0,
+        ))
+        added = 0
+        updated = 0
+        for participant in result.participants:
+            try:
+                user = getattr(participant, "user", None)
+                if user is None:
+                    uid = getattr(participant, "user_id", None)
+                    if uid is None:
+                        continue
+                    try:
+                        user = await client.get_entity(uid)
+                    except Exception:
+                        continue
+                if not isinstance(user, User):
+                    continue
+                uid = user.id
+                name = user_display(user)
+                uname = getattr(user, "username", None)
+
+                existing = db.get_follow_state(uid, group_id)
+                if existing is None:
+                    db.add_followed_user(uid, group_id, name, uname, is_followed=1)
+                    added += 1
+                else:
+                    db.add_followed_user(uid, group_id, name, uname, is_followed=existing)
+                    updated += 1
+            except Exception as ex:
+                logger.debug(f"خطا در پردازش ادمین: {ex}")
+        logger.info(f"✅ sync admins {group_id}: +{added} new, ~{updated} updated")
+        return added
+    except ChatAdminRequiredError:
+        logger.warning(f"⛔ ربات ادمین گروه {group_id} نیست - نمی‌تونه لیست ادمین‌ها رو بگیره")
+        return 0
+    except Exception as ex:
+        logger.warning(f"خطا در گرفتن ادمین‌های گروه {group_id}: {ex}")
+        return 0
+
+
+# ═════════════════════════════════════════════
+# ۱۲) هندلر اصلی گروه
 # ═════════════════════════════════════════════
 async def group_handler(event):
     try:
@@ -1264,7 +1315,7 @@ async def group_handler(event):
             await handle_mediator_request(event, chat, sender, replied_target=replied_target)
             return
 
-        # ═══ دوم: بررسی ادمین بودن و مجاز بودن برای اجرای دستور ═══
+        # ═══ دوم: بررسی مجاز بودن برای اجرای دستور ═══
         try:
             sender = await event.get_sender()
         except Exception:
@@ -1273,7 +1324,6 @@ async def group_handler(event):
         can_cmd = await can_execute(chat.id, event.sender_id, user_obj=sender)
 
         if not can_cmd:
-            # کاربر عادی: فقط آنتی‌اسپم/آنتی‌لینک
             if sender and not getattr(sender, "bot", False):
                 try:
                     await check_antilink(event, chat, sender)
@@ -1369,7 +1419,7 @@ client.add_event_handler(group_handler, events.MessageEdited())
 
 
 # ═════════════════════════════════════════════
-# ۱۲) هندلر /start در پیوی
+# ۱۳) هندلر /start در پیوی
 # ═════════════════════════════════════════════
 MAIN_MENU_TEXT = (
     "╔══════════════════════════════════╗\n"
@@ -1424,7 +1474,7 @@ async def cmd_start(event):
 
 
 # ═════════════════════════════════════════════
-# ۱۳) هندلر دکمه‌های شیشه‌ای
+# ۱۴) هندلر دکمه‌های شیشه‌ای
 # ═════════════════════════════════════════════
 @client.on(events.CallbackQuery)
 async def on_callback(event):
@@ -1447,11 +1497,10 @@ async def on_callback(event):
             return
         if data.startswith("grp:"):
             gid = int(data.split(":", 1)[1])
+            await event.answer("⏳ در حال بارگذاری...", alert=False)
             await show_group_detail(event, gid)
-            await event.answer()
             return
         if data.startswith("flw_t:"):
-            # flw_t:{user_id}:{group_id}
             parts = data.split(":")
             uid = int(parts[1])
             gid = int(parts[2])
@@ -1461,7 +1510,7 @@ async def on_callback(event):
                 return
             status = "✅ پیروی می‌کنم" if new_state == 1 else "❌ پیروی نمی‌کنم"
             await event.answer(f"{status}", alert=False)
-            await show_group_detail(event, gid, skip_answer=True)
+            await show_group_detail(event, gid)
             return
 
         # ─── منوی اصلی ───
@@ -1526,7 +1575,10 @@ async def show_groups_list(event):
             f"{prem('wave', '👋')} ربات را به گروه اضافه کنید تا اینجا نمایش داده شود."
         )
         buttons = [[Button.inline("🔙 بازگشت", data=b"back")]]
-        await event.edit(text, buttons=buttons, parse_mode="html")
+        try:
+            await event.edit(text, buttons=buttons, parse_mode="html")
+        except MessageNotModifiedError:
+            pass
         return
 
     lines = [
@@ -1548,7 +1600,6 @@ async def show_groups_list(event):
 
     text = "\n".join(lines)
 
-    # دکمه‌های گروه‌ها
     buttons = []
     row = []
     for g in groups[:20]:
@@ -1562,16 +1613,25 @@ async def show_groups_list(event):
 
     buttons.append([Button.inline("🔙 بازگشت", data=b"back")])
 
-    await event.edit(text, buttons=buttons, parse_mode="html")
+    try:
+        await event.edit(text, buttons=buttons, parse_mode="html")
+    except MessageNotModifiedError:
+        pass
 
 
 # ═════════════════════════════════════════════
-# نمایش جزئیات یک گروه + لیست افراد مورد پیروی
+# نمایش جزئیات گروه + سینک همه ادمین‌ها
 # ═════════════════════════════════════════════
-async def show_group_detail(event, group_id, skip_answer=False):
+async def show_group_detail(event, group_id):
     group = db.get_bot_group(group_id)
     group_title = group.get("title") if group else "—"
     group_username = group.get("username") if group else None
+
+    # ═══ سینک همه ادمین‌های گروه از تلگرام ═══
+    try:
+        await sync_group_admins(group_id)
+    except Exception as ex:
+        logger.debug(f"sync admins error: {ex}")
 
     users = db.get_followed_users(group_id)
 
@@ -1587,7 +1647,7 @@ async def show_group_detail(event, group_id, skip_answer=False):
         "╔══════════════════════════════════╗",
         f"   {prem('building', '🏢')} <b>جزئیات گروه</b>",
         "╚══════════════════════════════════╝\n",
-        f"┏━━━ {prem('group', '📌')} <b>اطلاعات گروه</b> ━━━┓\n"
+        "┏━━━ " + prem('group', '📌') + " <b>اطلاعات گروه</b> ━━━┓\n"
         f"┃ {prem('tag', '🏷️')} <b>نام:</b> {title_txt}\n"
         f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{group_id}</code>\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛\n",
@@ -1599,7 +1659,7 @@ async def show_group_detail(event, group_id, skip_answer=False):
     if not users:
         lines.append(
             f"\n{prem('info', 'ℹ️')} <i>هیچ کسی هنوز ثبت نشده.</i>\n"
-            f"به محض اینکه ادمین گروه پیامی بفرسته، خودکار اضافه می‌شه."
+            f"اگه ربات دسترسی ادمین داره، ادمین‌های گروه خودکار اضافه می‌شن."
         )
     else:
         for u in users[:15]:
@@ -1608,20 +1668,23 @@ async def show_group_detail(event, group_id, skip_answer=False):
             uname = u.get("username")
             is_followed = u.get("is_followed") == 1
 
+            uname_line = ""
+            if uname:
+                uname_line = f"\n┃ {prem('link', '🔗')} <a href=\"https://t.me/{uname}\">@{uname}</a>"
+
             if uid in SUPER_ADMINS:
-                # ادمین ارشد
                 lines.append(
                     f"\n{prem('crown', '👑')} <b>[ادمین ارشد]</b> {h(name)}\n"
-                    f"┃ {prem('id', '🆔')} <a href=\"tg://user?id={uid}\">{uid}</a>\n"
-                    f"┃ {'┃ ' + prem('link', '🔗') + ' ' + f'<a href=\"https://t.me/{uname}\">@{uname}</a>' if uname else ''}"
+                    f"┃ {prem('id', '🆔')} <a href=\"tg://user?id={uid}\">{uid}</a>"
+                    f"{uname_line}"
                 )
             else:
                 status_icon = prem('green', '🟢') if is_followed else prem('red', '🔴')
                 status_text = "پیروی می‌کنم" if is_followed else "پیروی نمی‌کنم"
                 lines.append(
                     f"\n{status_icon} <b>{h(name)}</b>\n"
-                    f"┃ {prem('id', '🆔')} <a href=\"tg://user?id={uid}\">{uid}</a>\n"
-                    f"┃ {'┃ ' + prem('link', '🔗') + ' ' + f'<a href=\"https://t.me/{uname}\">@{uname}</a>' if uname else ''}\n"
+                    f"┃ {prem('id', '🆔')} <a href=\"tg://user?id={uid}\">{uid}</a>"
+                    f"{uname_line}\n"
                     f"┃ 📍 وضعیت: {status_text}"
                 )
 
@@ -1638,7 +1701,7 @@ async def show_group_detail(event, group_id, skip_answer=False):
         is_followed = u.get("is_followed") == 1
 
         if uid in SUPER_ADMINS:
-            continue  # ادمین‌های ارشد toggle ندارن
+            continue
 
         if is_followed:
             label = f"✅ {name}"
@@ -2013,7 +2076,7 @@ async def cb_settings(event):
 
 
 # ═════════════════════════════════════════════
-# ۱۴) دستورات مدیریتی در پیوی
+# ۱۵) دستورات مدیریتی در پیوی
 # ═════════════════════════════════════════════
 @client.on(events.NewMessage(
     pattern=r"^/addadmin\s+(-?\d+)(?:\s+(-?\d+))?$",
@@ -2093,7 +2156,7 @@ async def cmd_stats(event):
 
 
 # ═════════════════════════════════════════════
-# ۱۵) وب‌سرور Flask
+# ۱۶) وب‌سرور Flask
 # ═════════════════════════════════════════════
 web_app = Flask(__name__)
 
@@ -2115,7 +2178,7 @@ def run_web_server():
 
 
 # ═════════════════════════════════════════════
-# ۱۶) راه‌اندازی ربات
+# ۱۷) راه‌اندازی ربات
 # ═════════════════════════════════════════════
 async def _periodic_cleanup():
     while True:
@@ -2170,7 +2233,7 @@ async def main():
 
 
 # ═════════════════════════════════════════════
-# ۱۷) نقطه ورود
+# ۱۸) نقطه ورود
 # ═════════════════════════════════════════════
 if __name__ == "__main__":
     try:
