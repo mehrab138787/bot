@@ -46,6 +46,7 @@ API_HASH = os.getenv("API_HASH", "eb06d4abfb49dc3eeb1aeb98ae0f581e").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 SECOND_ADMIN_ID = int(os.getenv("SECOND_ADMIN_ID", "0") or 0)
+THIRD_ADMIN_ID = int(os.getenv("THIRD_ADMIN_ID", "0") or 0)
 SESSION_NAME = os.getenv("SESSION_NAME", "group_manager_bot")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
@@ -59,7 +60,8 @@ IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 MAX_MUTE_SECONDS = 366 * 86400
 DEFAULT_MAX_WARNINGS = 3
 
-SUPER_ADMINS = [uid for uid in (OWNER_ID, SECOND_ADMIN_ID) if uid]
+# لیست همه ادمین‌های ارشد (مالک + ادمین‌های لاگ‌گیرنده)
+SUPER_ADMINS = [uid for uid in (OWNER_ID, SECOND_ADMIN_ID, THIRD_ADMIN_ID) if uid]
 
 # ═════════════════════════════════════════════
 # تنظیمات قابلیت واسطه
@@ -415,24 +417,15 @@ def parse_duration(text):
     """
     تشخیص مدت زمان و دلیل.
     خروجی: (seconds, reason)
-
-    قوانین:
-    - «20» یا «555» → بدون واحد، پیش‌فرض دقیقه
-    - «20m» / «2h» / «1d» / «30s» → با واحد مشخص
-    - «20 تبلیغ» / «555 اسپم» → عدد بدون واحد + دلیل
-    - «20m اسپم» / «2h تبلیغ» → عدد با واحد + دلیل
-    - «اسپم» → بدون عدد، ۱ ساعت پیش‌فرض + دلیل
     """
     text = (text or "").strip()
     if not text:
         return 3600, ""
 
-    # جدا کردن اولین توکن از بقیه متن
     parts = text.split(None, 1)
     first = parts[0]
     rest = parts[1].strip() if len(parts) > 1 else ""
 
-    # بررسی: آیا اولین توکن یک عدد با/بدون واحد است؟
     m = re.match(r"^(\d+)([smhdSMHD])?$", first)
     if m:
         num = int(m.group(1))
@@ -442,10 +435,9 @@ def parse_duration(text):
         if seconds > MAX_MUTE_SECONDS:
             seconds = MAX_MUTE_SECONDS
         if seconds <= 0:
-            seconds = 60  # حداقل ۱ دقیقه
+            seconds = 60
         return seconds, rest
 
-    # بدون عدد → کل متن دلیل، ۱ ساعت پیش‌فرض
     return 3600, text
 
 
@@ -577,17 +569,35 @@ async def get_reply_target(event):
         return None
 
 
-def is_mediator_group(chat_id):
-    try:
-        return abs(int(chat_id)) == MEDIATOR_CHAT_ID
-    except Exception:
-        return False
+def is_mediator_group(chat_id, raw_chat_id=None):
+    """
+    تشخیص چت واسطه - هم با فرمت -100... هم با فرمت بدون 100 کار می‌کنه.
+    """
+    candidates = set()
+
+    def add_candidates(val):
+        try:
+            s = str(abs(int(val)))
+            candidates.add(int(s))  # مثلاً 4337969779 یا 1004337969779
+            if s.startswith("100") and len(s) > 10:
+                candidates.add(int(s[3:]))       # 4337969779
+            else:
+                candidates.add(int("100" + s))   # 1004337969779
+        except Exception:
+            pass
+
+    add_candidates(chat_id)
+    if raw_chat_id is not None:
+        add_candidates(raw_chat_id)
+
+    return MEDIATOR_CHAT_ID in candidates
 
 
 # ═════════════════════════════════════════════
 # ۷) ارسال گزارش
 # ═════════════════════════════════════════════
 async def send_report(text):
+    """ارسال گزارش به همه ادمین‌های ارشد + کانال لاگ"""
     for admin_id in SUPER_ADMINS:
         try:
             await client.send_message(admin_id, text, parse_mode="html", link_preview=False)
@@ -1018,7 +1028,7 @@ async def group_handler(event):
         raw_text = (event.raw_text or "").strip()
 
         # ═══ اول: بررسی درخواست واسطه ═══
-        if is_mediator_group(chat.id) and MEDIATOR_KEYWORD in raw_text:
+        if is_mediator_group(event.chat_id, chat.id) and MEDIATOR_KEYWORD in raw_text:
             try:
                 sender = await event.get_sender()
             except Exception:
@@ -1567,6 +1577,7 @@ async def _periodic_cleanup():
 
 async def main():
     logger.info("🚀 راه‌اندازی ربات گروه‌بان...")
+    logger.info(f"👥 ادمین‌های ارشد: {SUPER_ADMINS}")
 
     if not BOT_TOKEN:
         raise ValueError("❌ BOT_TOKEN باید تنظیم شود.")
