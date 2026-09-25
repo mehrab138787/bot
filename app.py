@@ -4,7 +4,7 @@
 ║         🤖  ربات مدیریت حرفه‌ای گروه‌های تلگرام  🤖           ║
 ║                    Group Manager Bot                         ║
 ║         Telethon + PostgreSQL + Flask + asyncio              ║
-║  ✨ ایموجی پرمیوم + واسطه + مدیریت گروه‌ها + صفحه‌بندی ✨   ║
+║  ✨ ایموجی پرمیوم + واسطه + محدودیت زمانی + صفحه‌بندی ✨   ║
 ║           🚀 آماده استقرار روی Render (Web Service)          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
@@ -74,6 +74,11 @@ MEDIATOR_CHAT_ID = 1004337969779
 MEDIATOR_KEYWORD = "واسطه"
 MEDIATOR_USERNAMES = ["@mAMmA2222", "@mamad_slayer"]
 MEDIATOR_COOLDOWN_SECONDS = 30
+
+# ═══ محدودیت زمانی واسطه (به وقت ایران) ═══
+# از ساعت 1 بامداد تا 13 (1 بعدازظهر) = استراحت واسطه‌ها
+MEDIATOR_OFF_START_HOUR = 1     # 01:00
+MEDIATOR_OFF_END_HOUR = 13      # 13:00
 
 _MEDIATOR_COOLDOWN = {}
 _MEDIATOR_REQUESTS = {}
@@ -492,6 +497,8 @@ PREMIUM_EMOJI = {
     "rocket": "5424972470023104089",
     "building": "5447410659077661506",
     "eye": "5397782960512444700",
+    "sleep": "5458603043203327669",
+    "moon": "6337048821603763745",
     "thumbs_up": "5337080053119336309",
     "thumbs_down": "5210952531676504517",
 }
@@ -593,6 +600,15 @@ def build_message_link(chat_id, message_id):
     if s.startswith("-100"):
         return f"https://t.me/c/{s[4:]}/{message_id}"
     return None
+
+
+def is_mediator_off_time():
+    """آیا الان ساعت استراحت واسطه‌هاست؟ (از ۱ بامداد تا ۱۳)"""
+    now_ir = datetime.now(IRAN_TZ)
+    hour = now_ir.hour
+    if MEDIATOR_OFF_START_HOUR <= hour < MEDIATOR_OFF_END_HOUR:
+        return True
+    return False
 
 
 def format_report(action_title, action_emoji_key, target, admin_user, chat,
@@ -776,6 +792,11 @@ async def send_report(text, buttons=None):
 # ۸) سیستم واسطه خودکار
 # ═════════════════════════════════════════════
 async def handle_mediator_request(event, chat, sender, replied_target=None):
+    # ═══ چک ساعت استراحت ═══
+    if is_mediator_off_time():
+        logger.info(f"🌙 درخواست واسطه در ساعت استراحت - نادیده گرفته شد")
+        return
+
     now_ts = datetime.now(timezone.utc).timestamp()
     uid = sender.id if sender else event.sender_id
 
@@ -1299,7 +1320,11 @@ async def group_handler(event):
 
         raw_text = (event.raw_text or "").strip()
 
+        # ═══ اول: بررسی درخواست واسطه ═══
         if is_mediator_group(event.chat_id, chat.id) and is_mediator_request(raw_text):
+            # ساعت استراحت → بی‌واکنش
+            if is_mediator_off_time():
+                return
             try:
                 sender = await event.get_sender()
             except Exception:
@@ -1476,12 +1501,10 @@ async def on_callback(event):
 
         data = event.data.decode("utf-8", "ignore")
 
-        # ─── دکمه‌های واسطه ───
         if data.startswith("med_a:") or data.startswith("med_r:"):
             await handle_mediator_callback(event, data)
             return
 
-        # ─── دکمه‌های مدیریت گروه‌ها ───
         if data == "grp_list":
             await show_groups_list(event)
             await event.answer()
@@ -1515,7 +1538,6 @@ async def on_callback(event):
             await event.answer()
             return
 
-        # ─── منوی اصلی ───
         if data == "back":
             await event.edit(MAIN_MENU_TEXT, buttons=MAIN_MENU_BUTTONS, parse_mode="html")
             await event.answer()
@@ -1715,7 +1737,6 @@ async def show_group_detail(event, group_id, page=0):
 
     text = "\n".join(lines)
 
-    # دکمه‌های toggle برای ادمین‌های این صفحه
     buttons = []
     for u in page_users:
         uid = u["user_id"]
@@ -1732,7 +1753,6 @@ async def show_group_detail(event, group_id, page=0):
             Button.inline(label, data=f"flw_t:{uid}:{group_id}:{page}".encode()),
         ])
 
-    # دکمه‌های صفحه‌بندی
     nav_row = []
     if total_pages > 1:
         if page > 0:
@@ -1913,6 +1933,7 @@ async def cb_stats(event):
     db.cleanup_expired_mutes()
     max_warns = db.get_setting("max_warnings", str(DEFAULT_MAX_WARNINGS)) or str(DEFAULT_MAX_WARNINGS)
     groups_count = len(db.get_bot_groups())
+    off_time_status = "🌙 در حال استراحت" if is_mediator_off_time() else "✅ فعال"
     text = (
         "╔══════════════════════════════════╗\n"
         f"   {prem('stats', '📊')} <b>آمار کلی ربات</b> {prem('stats', '📊')}\n"
@@ -1925,6 +1946,10 @@ async def cb_stats(event):
         f"┃ {prem('building', '🏢')} <b>گروه‌های ربات:</b> <code>{groups_count}</code>\n"
         f"┃ 📝 <b>تعداد کل لاگ‌ها:</b> <code>{db.count_logs()}</code>\n"
         f"┃ {prem('target', '🎯')} <b>سقف اخطار:</b> <code>{max_warns}</code>\n"
+        "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+        "┏━━━ " + prem('handshake', '🤝') + " <b>وضعیت واسطه</b> ━━━┓\n"
+        f"┃ {off_time_status}\n"
+        f"┃ {prem('clock', '⏱')} استراحت: <code>01:00 - 13:00</code>\n"
         "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
         f"{prem('time', '⏱')} <b>آخرین بروزرسانی:</b>\n<code>{now_iran_str()}</code>"
     )
@@ -2088,6 +2113,7 @@ async def cb_help(event):
         "┏━━━ " + prem('handshake', '🤝') + " <b>واسطه</b> ━━━┓\n"
         f"┃ در گپ <code>{MEDIATOR_CHAT_ID}</code> بنویسید:\n"
         "┃ <code>واسطه</code> (دقیقاً فقط همین کلمه)\n"
+        f"┃ {prem('clock', '⏱')} استراحت: <code>01:00 - 13:00</code>\n"
         "┗━━━━━━━━━━━━━━━┛"
     )
     await event.edit(text, buttons=[[Button.inline("🔙 بازگشت", data=b"back")]], parse_mode="html")
@@ -2097,6 +2123,7 @@ async def cb_settings(event):
     anti_spam = db.get_bool_setting("anti_spam", False)
     anti_link = db.get_bool_setting("anti_link", False)
     max_warns = db.get_setting("max_warnings", str(DEFAULT_MAX_WARNINGS)) or str(DEFAULT_MAX_WARNINGS)
+    off_time_status = "🌙 در حال استراحت" if is_mediator_off_time() else "✅ فعال"
     text = (
         "╔══════════════════════════════════╗\n"
         f"   {prem('settings', '⚙️')} <b>تنظیمات ربات</b> {prem('settings', '⚙️')}\n"
@@ -2105,6 +2132,9 @@ async def cb_settings(event):
         f"┃ {prem('alert', '🚨')} ضد اسپم: {'✅ روشن' if anti_spam else '❌ خاموش'}\n"
         f"┃ {prem('link', '🔗')} ضد لینک: {'✅ روشن' if anti_link else '❌ خاموش'}\n"
         f"┃ {prem('warning', '⚠️')} سقف اخطار: <code>{max_warns}</code>\n\n"
+        f"{prem('handshake', '🤝')} <b>واسطه:</b>\n"
+        f"┃ {off_time_status}\n"
+        f"┃ {prem('clock', '⏱')} استراحت: <code>01:00 - 13:00</code>\n\n"
         "برای تغییر، روی دکمه‌ها کلیک کنید:"
     )
     buttons = [
@@ -2170,7 +2200,8 @@ async def cmd_help(event):
         f"{prem('warning', '⚠️')} <code>اخطار [دلیل]</code> - اخطار (دلیل اجباری)\n"
         f"{prem('check', '✔️')} <code>حذف اخطار</code> - پاک کردن اخطارها\n\n"
         f"{prem('handshake', '🤝')} <b>واسطه خودکار:</b>\n"
-        f"در گپ <code>{MEDIATOR_CHAT_ID}</code> کافیه بنویسید <code>واسطه</code>\n\n"
+        f"در گپ <code>{MEDIATOR_CHAT_ID}</code> کافیه بنویسید <code>واسطه</code>\n"
+        f"{prem('clock', '⏱')} ساعت استراحت: <code>01:00 - 13:00</code>\n\n"
         f"{prem('time', '⏱')} {now_iran_str()}"
     )
     await event.respond(text, parse_mode="html")
@@ -2182,6 +2213,7 @@ async def cmd_help(event):
 ))
 async def cmd_stats(event):
     db.cleanup_expired_mutes()
+    off_time_status = "🌙 در حال استراحت" if is_mediator_off_time() else "✅ فعال"
     text = (
         f"{prem('stats', '📊')} <b>آمار کلی ربات</b>\n\n"
         f"{prem('ban', '🚫')} بن‌های فعال: <code>{db.count_bans()}</code>\n"
@@ -2189,6 +2221,7 @@ async def cmd_stats(event):
         f"{prem('warning', '⚠️')} کل اخطارها: <code>{db.count_warnings()}</code>\n"
         f"{prem('admin', '🛡')} ادمین‌ها: <code>{db.count_admins()}</code>\n"
         f"{prem('building', '🏢')} گروه‌های ربات: <code>{len(db.get_bot_groups())}</code>\n"
+        f"{prem('handshake', '🤝')} واسطه: {off_time_status}\n"
         f"📝 لاگ‌ها: <code>{db.count_logs()}</code>\n\n"
         f"{prem('time', '⏱')} {now_iran_str()}"
     )
@@ -2236,6 +2269,7 @@ async def _periodic_cleanup():
 async def main():
     logger.info("🚀 راه‌اندازی ربات گروه‌بان...")
     logger.info(f"👥 ادمین‌های ارشد: {SUPER_ADMINS}")
+    logger.info(f"🌙 ساعت استراحت واسطه: {MEDIATOR_OFF_START_HOUR}:00 تا {MEDIATOR_OFF_END_HOUR}:00 (به وقت ایران)")
 
     if not BOT_TOKEN:
         raise ValueError("❌ BOT_TOKEN باید تنظیم شود.")
@@ -2259,6 +2293,9 @@ async def main():
                 f"┃ 🤖 <b>یوزرنیم:</b> @{me.username}\n"
                 f"┃ {prem('id', '🆔')} <b>آیدی:</b> <code>{me.id}</code>\n"
                 f"┃ {prem('time', '⏱')} <b>زمان:</b> {now_iran_str()}\n"
+                "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
+                "┏━━━ " + prem('handshake', '🤝') + " <b>واسطه</b> ━━━┓\n"
+                f"┃ {prem('clock', '⏱')} استراحت: <code>01:00 - 13:00</code>\n"
                 "┗━━━━━━━━━━━━━━━━━━━━┛\n\n"
                 f"{prem('star', '⭐')} برای دیدن پنل مدیریت، /start را ارسال کنید.",
                 parse_mode="html",
