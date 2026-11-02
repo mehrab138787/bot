@@ -7,10 +7,19 @@
 ║  ✨ ایموجی پرمیوم + واسطه + محدودیت زمانی + صفحه‌بندی ✨   ║
 ║           🚀 آماده استقرار روی Render (Web Service)          ║
 ╚══════════════════════════════════════════════════════════════╝
+
+🔧 FIXES APPLIED:
+   ✓ Dedupe SUPER_ADMINS (رفع پیام تکراری)
+   ✓ Message deduplication (رفع ثبت دوبار)
+   ✓ send_report dedup (رفع گزارش تکراری)
+   ✓ Auto-reconnect برای PostgreSQL
+   ✓ Cache برای sync_group_admins
+   ✓ Memory cleanup برای دیکشنری‌های in-memory
 """
 
 import os
 import re
+import time
 import asyncio
 import logging
 import threading
@@ -65,7 +74,11 @@ IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 MAX_MUTE_SECONDS = 366 * 86400
 DEFAULT_MAX_WARNINGS = 3
 
-SUPER_ADMINS = [uid for uid in (OWNER_ID, SECOND_ADMIN_ID, THIRD_ADMIN_ID) if uid]
+# ✅ FIX #1: حذف تکراری‌ها از SUPER_ADMINS - جلوگیری از ارسال دوباره پیام
+# اگر OWNER_ID و SECOND_ADMIN_ID یکی باشند، قبلاً گزارش دو بار ارسال می‌شد
+SUPER_ADMINS = list(dict.fromkeys(
+    uid for uid in (OWNER_ID, SECOND_ADMIN_ID, THIRD_ADMIN_ID) if uid
+))
 
 # ═════════════════════════════════════════════
 # تنظیمات قابلیت واسطه
@@ -82,6 +95,14 @@ MEDIATOR_OFF_END_HOUR = 13      # 13:00
 
 _MEDIATOR_COOLDOWN = {}
 _MEDIATOR_REQUESTS = {}
+
+# ✅ FIX #2: کش deduplication برای پیام‌ها - جلوگیری از پردازش دوباره
+_MSG_DEDUP = {}
+_MSG_DEDUP_TTL = 60  # ثانیه
+
+# ✅ FIX #3: کش برای sync_group_admins - جلوگیری از درخواست تکراری به تلگرام
+_SYNC_CACHE = {}
+_SYNC_CACHE_TTL = 600  # 10 دقیقه
 
 # تعداد ادمین در هر صفحه
 USERS_PER_PAGE = 20
@@ -126,7 +147,25 @@ class Database:
         self.conn.autocommit = True
         self._create_tables()
 
+    # ✅ FIX #4: auto-reconnect در صورت قطع اتصال
     def _cursor(self):
+        try:
+            if self.conn is None or self.conn.closed:
+                logger.warning("⚠️ اتصال دیتابیس قطع شده - در حال اتصال مجدد...")
+                self.conn = psycopg2.connect(self.db_url)
+                self.conn.autocommit = True
+            # بررسی سلامت اتصال
+            with self.conn.cursor() as _check:
+                _check.execute("SELECT 1")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as ex:
+            logger.warning(f"⚠️ خطای اتصال دیتابیس - تلاش مجدد: {ex}")
+            try:
+                if self.conn is not None and not self.conn.closed:
+                    self.conn.close()
+            except Exception:
+                pass
+            self.conn = psycopg2.connect(self.db_url)
+            self.conn.autocommit = True
         return self.conn.cursor(cursor_factory=RealDictCursor)
 
     def _create_tables(self):
@@ -611,6 +650,37 @@ def is_mediator_off_time():
     return False
 
 
+# ✅ FIX #2: تابع deduplication پیام‌ها - جلوگیری از پردازش دوباره همان پیام
+def _is_duplicate_message(chat_id, msg_id, text):
+    """
+    بررسی می‌کند که آیا این پیام قبلاً پردازش شده یا نه.
+    کلید یکتاست: (chat_id, msg_id, hash(text))
+    اگر همان پیام دقیقاً با همان متن در ۶۰ ثانیه اخیر پردازش شده باشد → True
+    اگر متن تغییر کند (edit) → به عنوان پیام جدید پردازش می‌شود
+    """
+    now = time.time()
+    key = (chat_id, msg_id)
+    text_hash = hash(text or "")
+
+    # پاکسازی دوره‌ای
+    if len(_MSG_DEDUP) > 500:
+        cutoff = now - _MSG_DEDUP_TTL
+        for k in list(_MSG_DEDUP.keys()):
+            if _MSG_DEDUP[k][0] < cutoff:
+                del _MSG_DEDUP[k]
+
+    if key in _MSG_DEDUP:
+        ts, hashes = _MSG_DEDUP[key]
+        if now - ts < _MSG_DEDUP_TTL and text_hash in hashes:
+            return True  # تکراری
+        hashes.add(text_hash)
+        _MSG_DEDUP[key] = (now, hashes)
+        return False
+    else:
+        _MSG_DEDUP[key] = (now, {text_hash})
+        return False
+
+
 def format_report(action_title, action_emoji_key, target, admin_user, chat,
                   reason, link, target_message=None):
     target_name = user_display(target)
@@ -770,7 +840,13 @@ def is_mediator_request(raw_text):
 # ۷) ارسال گزارش
 # ═════════════════════════════════════════════
 async def send_report(text, buttons=None):
+    # ✅ FIX: dedup در ارسال گزارش - اگر LOG_CHANNEL_ID با یکی از ادمین‌ها یکی بود
+    # یا SUPER_ADMINS تکراری داشت، فقط یک بار ارسال می‌شود
+    sent_to = set()
     for admin_id in SUPER_ADMINS:
+        if admin_id in sent_to:
+            continue
+        sent_to.add(admin_id)
         try:
             await client.send_message(
                 admin_id, text, parse_mode="html",
@@ -779,7 +855,7 @@ async def send_report(text, buttons=None):
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش به {admin_id}: {ex}")
 
-    if LOG_CHANNEL_ID:
+    if LOG_CHANNEL_ID and LOG_CHANNEL_ID not in sent_to:
         try:
             await client.send_message(
                 LOG_CHANNEL_ID, text, parse_mode="html", link_preview=False
@@ -900,7 +976,11 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
     ]]
 
     sent_messages = []
+    sent_to = set()  # ✅ dedup
     for admin_id in SUPER_ADMINS:
+        if admin_id in sent_to:
+            continue
+        sent_to.add(admin_id)
         try:
             msg = await client.send_message(
                 admin_id, admin_msg, parse_mode="html",
@@ -910,7 +990,7 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
         except Exception as ex:
             logger.error(f"خطا در ارسال گزارش واسطه به {admin_id}: {ex}")
 
-    if LOG_CHANNEL_ID:
+    if LOG_CHANNEL_ID and LOG_CHANNEL_ID not in sent_to:
         try:
             msg = await client.send_message(
                 LOG_CHANNEL_ID, admin_msg, parse_mode="html",
@@ -932,6 +1012,7 @@ async def handle_mediator_request(event, chat, sender, replied_target=None):
         "chat_title": chat_title,
         "chat_id": chat.id,
         "timestamp": now_iran_str(),
+        "created_ts": now_ts,  # ✅ برای cleanup
     }
 
     db.add_log("mediator-request", uid, 0, chat.id, "درخواست واسطه")
@@ -986,6 +1067,9 @@ async def check_antilink(event, chat, sender):
     if not db.get_bool_setting("anti_link", False):
         return
     if not event.raw_text:
+        return
+    # ✅ FIX: null safety
+    if sender is None or getattr(sender, "bot", False):
         return
     if await is_admin_or_owner(chat.id, sender.id):
         return
@@ -1250,8 +1334,15 @@ async def do_unwarn(event, chat, target, reason, admin_user):
 # ═════════════════════════════════════════════
 # ۱۱) سینک ادمین‌های گروه از تلگرام
 # ═════════════════════════════════════════════
-async def sync_group_admins(group_id):
+async def sync_group_admins(group_id, force=False):
     """همه ادمین‌های گروه رو از تلگرام می‌گیره و توی دیتابیس ثبت می‌کنه"""
+    # ✅ FIX #3: کش ۱۰ دقیقه‌ای برای جلوگیری از درخواست‌های تکراری به تلگرام
+    now_ts = time.time()
+    if not force and group_id in _SYNC_CACHE:
+        if now_ts - _SYNC_CACHE[group_id] < _SYNC_CACHE_TTL:
+            return 0
+    _SYNC_CACHE[group_id] = now_ts
+
     try:
         result = await client(GetParticipantsRequest(
             channel=group_id,
@@ -1307,6 +1398,12 @@ async def group_handler(event):
             return
         chat = await event.get_chat()
         if not hasattr(chat, "title"):
+            return
+
+        # ✅ FIX #2: deduplication - جلوگیری از پردازش دوباره‌ی همان پیام
+        # این مهم‌ترین رفع باگ «ثبت دوبار» است
+        if _is_duplicate_message(chat.id, event.id, event.raw_text):
+            logger.debug(f"🔁 پیام تکراری نادیده گرفته شد: chat={chat.id} msg={event.id}")
             return
 
         me = await client.get_me()
@@ -2257,10 +2354,46 @@ async def _periodic_cleanup():
     while True:
         try:
             db.cleanup_expired_mutes()
-            if len(_MEDIATOR_REQUESTS) > 100:
-                sorted_keys = sorted(_MEDIATOR_REQUESTS.keys())
-                for k in sorted_keys[:50]:
-                    _MEDIATOR_REQUESTS.pop(k, None)
+            now_ts = time.time()
+
+            # ✅ FIX: پاکسازی mediator requests قدیمی (بیشتر از ۲۴ ساعت)
+            expired_reqs = []
+            for req_id, req in list(_MEDIATOR_REQUESTS.items()):
+                created = req.get("created_ts", 0)
+                if now_ts - created > 86400:  # 24 hours
+                    expired_reqs.append(req_id)
+            for k in expired_reqs:
+                _MEDIATOR_REQUESTS.pop(k, None)
+
+            # ✅ FIX: پاکسازی _MEDIATOR_COOLDOWN قدیمی
+            if len(_MEDIATOR_COOLDOWN) > 1000:
+                cutoff = now_ts - 3600
+                for uid in list(_MEDIATOR_COOLDOWN.keys()):
+                    if _MEDIATOR_COOLDOWN[uid] < cutoff:
+                        _MEDIATOR_COOLDOWN.pop(uid, None)
+
+            # ✅ FIX: پاکسازی _SPAM_TRACKER غیرفعال
+            if len(_SPAM_TRACKER) > 500:
+                cutoff = now_ts - 3600
+                for key in list(_SPAM_TRACKER.keys()):
+                    dq = _SPAM_TRACKER[key]
+                    if not dq or (now_ts - dq[-1] > 3600):
+                        del _SPAM_TRACKER[key]
+
+            # ✅ FIX: پاکسازی _MSG_DEDUP
+            if len(_MSG_DEDUP) > 1000:
+                cutoff = now_ts - _MSG_DEDUP_TTL
+                for k in list(_MSG_DEDUP.keys()):
+                    if _MSG_DEDUP[k][0] < cutoff:
+                        del _MSG_DEDUP[k]
+
+            # ✅ FIX: پاکسازی _SYNC_CACHE
+            if len(_SYNC_CACHE) > 200:
+                cutoff = now_ts - _SYNC_CACHE_TTL
+                for k in list(_SYNC_CACHE.keys()):
+                    if _SYNC_CACHE[k] < cutoff:
+                        del _SYNC_CACHE[k]
+
         except Exception as ex:
             logger.warning(f"cleanup error: {ex}")
         await asyncio.sleep(60)
@@ -2282,7 +2415,12 @@ async def main():
     me = await client.get_me()
     logger.info(f"✅ ربات متصل شد: @{me.username} (ID: {me.id})")
 
+    # ✅ ارسال پیام راه‌اندازی - با dedup
+    sent_to = set()
     for admin_id in SUPER_ADMINS:
+        if admin_id in sent_to:
+            continue
+        sent_to.add(admin_id)
         try:
             await client.send_message(
                 admin_id,
